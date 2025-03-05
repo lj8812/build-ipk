@@ -1,18 +1,18 @@
-name: OpenClash AutoBuild (Master Branch)
+name: OpenClash AutoBuilder (Stable)
 
 on:
+  # 触发条件：任何.yml文件变更时触发
   push:
     paths:
-      - '.github/workflows/*.yml'
-    branches: [ "master" ]
-  
-  schedule:
-    - cron: '0 12 * * 1'  # 每周一UTC中午12点自动构建
+      - '**.yml'
+      - '**.yaml'
+    branches: [ "main", "master" ]
 
+  # 保留手动触发功能
   workflow_dispatch:
     inputs:
       target:
-        description: '目标架构 (x86/64, arm/armv7等)'
+        description: '目标架构 (示例: x86/64)'
         required: true
         default: 'x86/64'
       firmware_version:
@@ -27,130 +27,155 @@ on:
 env:
   BUILD_DIR: ${{ github.workspace }}/openwrt-build
   PLUGIN_NAME: luci-app-openclash
+  CACHE_DIR: ${{ runner.temp }}/sdk_cache
+  MIRROR_LIST: >
+    https://downloads.openwrt.org,
+    https://mirror.sjtu.edu.cn/openwrt,
+    https://mirrors.tuna.tsinghua.edu.cn/openwrt,
+    https://openwrt.proxy.ustclug.org
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        arch: [ 'x86/64', 'arm/armv7' ]  # 可扩展其他架构
 
     steps:
-    - name: 🛠️ 初始化环境
-      run: |
-        mkdir -p $BUILD_DIR
-        echo "构建开始时间: $(date +'%Y-%m-%d %H:%M:%S %Z')"
+    # --------------------- 初始化阶段 ---------------------
+    - name: 🛠️ 初始化工作区
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
 
-    - name: 🔍 解析目标架构
+    - name: 📥 安装基础依赖
       run: |
-        case "${{ github.event.inputs.target }}" in
-          "x86/64")    ARCH="amd64"; TARGET_CFG="x86_64" ;;
-          "arm/armv7") ARCH="armv7"; TARGET_CFG="armv7" ;;
-          "armvirt/64") ARCH="armv8"; TARGET_CFG="armvirt" ;;
-          *)            ARCH="amd64"; TARGET_CFG="generic" ;;
-        esac
-        echo "ARCH=$ARCH" >> $GITHUB_ENV
-        echo "TARGET_CFG=$TARGET_CFG" >> $GITHUB_ENV
+        sudo apt-get update
+        sudo apt-get install -y \
+          aria2 xz-utils jq python3 python3-pip \
+          libssl-dev zlib1g-dev ccache
 
-    - name: 📦 下载OpenWrt SDK
+    # --------------------- 缓存管理 ---------------------
+    - name: 🗃️ SDK缓存管理
+      uses: actions/cache@v3
+      with:
+        path: ${{ env.CACHE_DIR }}
+        key: sdk-${{ matrix.arch }}-${{ inputs.firmware_version }}-v6
+        restore-keys: |
+          sdk-${{ matrix.arch }}-${{ inputs.firmware_version }}-
+          sdk-${{ matrix.arch }}-
+
+    # --------------------- 核心下载阶段 ---------------------
+    - name: 🌐 智能下载SDK
+      id: download_sdk
       run: |
-        SDK_PATH="releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}"
-        SDK_URL="https://downloads.openwrt.org/$SDK_PATH"
-        
-        echo "🔎 查找最新SDK文件..."
-        SDK_FILE=$(curl -sL "$SDK_URL" | grep -oE 'openwrt-sdk-.*?Linux-x86_64\.tar\.xz' | head -1)
-        
-        echo "🔗 下载地址: $SDK_URL/$SDK_FILE"
-        curl --retry 3 --retry-delay 10 -L -o sdk.tar.xz "$SDK_URL/$SDK_FILE"
-        
-        echo "🔒 验证压缩包..."
-        xz -t sdk.tar.xz || (echo "::error::文件校验失败"; exit 1)
-        
-        echo "📂 解压到 $BUILD_DIR"
-        tar -xJf sdk.tar.xz -C $BUILD_DIR --strip-components=1
-        rm -f sdk.tar.xz
+        # 参数构造
+        TARGET_PATH="${matrix.arch//\//-}"
+        FW_VER="${{ inputs.firmware_version }}"
+        CACHE_FILE="${{ env.CACHE_DIR }}/sdk_${TARGET_PATH}_${FW_VER}.tar.xz"
+
+        # 多源下载函数
+        download_with_retry() {
+          local url_pattern="$1"
+          for mirror in ${MIRROR_LIST//,/ }; do
+            full_url="${mirror}/releases/${FW_VER}/targets/${matrix.arch}/${url_pattern}"
+            echo "🔄 尝试下载: $full_url"
+            if aria2c -x8 -s8 -k1M --retry-wait=30 --file-allocation=none -o sdk_temp.tar.xz "$full_url"; then
+              if xz -tvv sdk_temp.tar.xz; then
+                mv sdk_temp.tar.xz "$CACHE_FILE"
+                echo "✅ 下载成功: ${full_url##*/}"
+                return 0
+              fi
+            fi
+          done
+          return 1
+        }
+
+        # 尝试多种文件名模式
+        patterns=(
+          "openwrt-sdk-${FW_VER}-${TARGET_PATH}_*"
+          "openwrt-sdk-${FW_VER%.*}-*-${TARGET_PATH}_*"
+        )
+
+        for pattern in "${patterns[@]}"; do
+          download_with_retry "$pattern" && break
+        done || {
+          echo "::error::所有镜像源均失败，尝试备用源..."
+          ghproxy_url="https://ghproxy.com/https://github.com/openwrt/sdk/releases/download/${FW_VER}/sdk_${TARGET_PATH}.tar.xz"
+          curl -L "$ghproxy_url" -o "$CACHE_FILE" || exit 1
+        }
+
+    # --------------------- 构建准备 ---------------------
+    - name: 🧱 准备构建环境
+      run: |
+        mkdir -p ${{ env.BUILD_DIR }}
+        tar -xJf ${{ env.CACHE_DIR }}/sdk_${matrix.arch//\//-}_${{ inputs.firmware_version }}.tar.xz \
+          -C ${{ env.BUILD_DIR }} --strip-components=1
 
     - name: 💾 获取插件源码
       run: |
-        cd $BUILD_DIR
-        echo "⬇️ 正在克隆 master 分支..."
-        git clone --depth 1 --branch master \
-          https://github.com/vernesong/OpenClash package/$PLUGIN_NAME || {
-            echo "::error::仓库克隆失败，请检查网络或分支名称"
-            exit 1
-          }
+        cd ${{ env.BUILD_DIR }}
+        git clone --filter=blob:none --branch master \
+          https://github.com/vernesong/OpenClash package/${{ env.PLUGIN_NAME }}
         
-        cd package/$PLUGIN_NAME/$PLUGIN_NAME
-        echo "🔧 修复Makefile格式..."
-        sed -i 's/^    /\t/g' Makefile
-        [ -f "Makefile" ] || { echo "::error::Makefile不存在"; exit 1; }
+        # 格式修正
+        find package/${{ env.PLUGIN_NAME }} -name Makefile -exec sed -i 's/^    /\t/g' {} +
 
-    - name: ⚙️ 预置核心文件
+    # --------------------- 编译阶段 ---------------------
+    - name: ⚙️ 配置编译参数
       run: |
-        CORE_DIR="$BUILD_DIR/package/$PLUGIN_NAME/$PLUGIN_NAME/files/etc/openclash/core"
-        mkdir -p $CORE_DIR
-        
-        echo "⬇️ 下载mihomo核心 (架构: $ARCH)..."
-        CORE_URL="https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core }}/mihomo-linux-$ARCH.gz"
-        
-        if ! curl -sL "$CORE_URL" | gunzip > "$CORE_DIR/clash"; then
-          echo "::error::核心下载失败，请检查版本和架构匹配"
-          exit 1
-        fi
-        chmod 755 "$CORE_DIR/clash"
-
-    - name: 🏗️ 配置编译环境
-      run: |
-        cd $BUILD_DIR
-        cat << EOF > .config
-        CONFIG_TARGET_${TARGET_CFG}=y
-        CONFIG_PACKAGE_${PLUGIN_NAME}=m
+        cd ${{ env.BUILD_DIR }}
+        cat > .config <<EOF
+        CONFIG_TARGET_${matrix.arch##*/}_DEVICE_generic=y
+        CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m
         CONFIG_PACKAGE_luci-compat=y
         EOF
         make defconfig
 
-    - name: 🚀 执行编译
+    - name: 🏭 执行编译
       run: |
-        cd $BUILD_DIR
-        echo "🛠️ 开始编译 (使用 $(nproc) 线程)..."
-        make -j$(nproc) V=s \
+        cd ${{ env.BUILD_DIR }}
+        make -j$(($(nproc) + 2)) \
+          V=sc \
+          CONFIG_SDK=y \
           CONFIG_DEBUG_SECTION_MISMATCH=y \
-          package/${PLUGIN_NAME}/compile
+          package/${{ env.PLUGIN_NAME }}/compile
 
-    - name: 📤 整理输出文件
-      run: |
-        OUTPUT_DIR="${{ github.workspace }}/artifacts"
-        mkdir -p $OUTPUT_DIR
-        
-        # 收集所有ipk文件
-        find $BUILD_DIR/bin -name '*.ipk' -exec cp {} $OUTPUT_DIR \;
-        
-        # 生成校验文件
-        cd $OUTPUT_DIR
-        sha256sum *.ipk > SHA256SUMS
-        echo "构建信息:" > build-info.txt
-        echo "目标架构: ${{ github.event.inputs.target }}" >> build-info.txt
-        echo "OpenWrt版本: ${{ github.event.inputs.firmware_version }}" >> build-info.txt
-        echo "核心版本: ${{ github.event.inputs.clash_core }}" >> build-info.txt
-        echo "编译时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> build-info.txt
-
-    - name: 🚢 发布版本
+    # --------------------- 发布阶段 ---------------------
+    - name: 🚀 发布制品
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          artifacts/*.ipk
-          artifacts/SHA256SUMS
-          artifacts/build-info.txt
-        tag_name: openclash-${{ github.event.inputs.clash_core }}-$(date +%m%d)
-        name: OpenClash ${{ github.event.inputs.clash_core }} Build
+          ${{ env.BUILD_DIR }}/bin/packages/**/*.ipk
+        tag_name: openclash-${{ inputs.clash_core }}-$(date +%Y%m%d)
+        name: OpenClash ${{ inputs.clash_core }} Build
         body: |
           ### 构建信息
-          - ​**架构**: `${{ github.event.inputs.target }}`
-          - ​**OpenWrt版本**: `${{ github.event.inputs.firmware_version }}`
-          - ​**核心版本**: `${{ github.event.inputs.clash_core }}`
-          - ​**编译时间**: `$(date -u +"%Y-%m-%dT%H:%M:%SZ")`
+          - ​**架构**: ${{ matrix.arch }}
+          - ​**固件版本**: ${{ inputs.firmware_version }}
+          - ​**核心版本**: ${{ inputs.clash_core }}
+          - ​**编译时间**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          ### 安装说明
+          ### SHA256校验
           ```bash
-          opkg install luci-app-openclash_*.ipk
+          $(sha256sum ${{ env.BUILD_DIR }}/bin/packages/**/*.ipk)
           ```
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # --------------------- 错误处理 ---------------------
+    - name: 🚨 失败通知
+      if: ${{ failure() }}
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `🚨 构建失败! 详细信息:\n
+              Job: ${context.job}\n
+              错误步骤: ${{ join(toJson(steps.*.conclusion)) }}\n
+              日志: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+          })
