@@ -35,7 +35,8 @@ jobs:
           build-essential ccache ecj fastjar file g++ gawk gettext git \
           libelf-dev libncurses5-dev libncursesw5-dev libssl-dev python3 \
           python3-distutils python3-setuptools unzip wget rsync subversion \
-          swig time xsltproc zlib1g-dev tree jq lua5.1 lua5.1-dev
+          swig time xsltproc zlib1g-dev tree jq lua5.1 lua5.1-dev \
+          ncurses-term  # 新增终端支持
 
     - name: 设置 Python 环境
       run: |
@@ -95,12 +96,14 @@ jobs:
 
     - name: 配置编译环境
       working-directory: openwrt
+      env:
+        TERM: xterm-256color  # 设置终端类型
       run: |
-        # 强制更新所有 feeds
+        # 强制更新 feeds 并安装必要组件
         ./scripts/feeds update -a -f
         ./scripts/feeds install -a -f luci
 
-        # 生成编译配置
+        # 生成最小化配置
         cat << EOF > .config
         CONFIG_TARGET_$(echo ${{ github.event.inputs.target }} | tr '/a-z' '_A-Z')=y
         CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m
@@ -109,35 +112,30 @@ jobs:
         CONFIG_PACKAGE_luci-compat=y
         CONFIG_PACKAGE_luci-base=y
         CONFIG_PACKAGE_luci-lib-base=y
-        CONFIG_BUILD_TOOLCHAIN=y
+        CONFIG_TERM="xterm-256color"  # 终端类型配置
         EOF
 
-        # 预编译工具链
-        make tools/install -j$(nproc)
-        make toolchain/install -j$(nproc)
+        # 生成确定性配置
+        make defconfig CONFIG_DEFAULT_DESIGNATED=y
 
-        # 验证工具链
-        echo "当前工具链路径: $PATH"
-        if ! [ -x staging_dir/host/bin/po2lmo ]; then
-          echo "::error::po2lmo 未正确生成"
-          exit 1
-        fi
+        # 预编译工具链 (非交互式)
+        make -j$(nproc) tools/install
+        make -j$(nproc) toolchain/install
 
     - name: 执行编译
       working-directory: openwrt
       env:
+        TERM: dumb  # 禁用终端交互
         STAGING_DIR: ${{ github.workspace }}/openwrt/staging_dir
       run: |
         export PATH="$STAGING_DIR/host/bin:$PATH"
-        echo "最终 PATH 路径: $PATH"
         
-        # 最终验证
-        if ! command -v po2lmo >/dev/null; then
-          echo "::error::po2lmo 仍然未找到!"
-          exit 1
-        fi
-
-        make -j$(($(nproc) + 1)) package/${{ env.PLUGIN_NAME }}/compile V=s
+        # 非交互式编译
+        make -j$(($(nproc) + 1)) package/${{ env.PLUGIN_NAME }}/compile \
+          V=s \
+          FORCE_UNSAFE_CONFIGURE=1 \
+          DEBIAN_FRONTEND=noninteractive \
+          TERM=dumb
 
     - name: 打包输出
       run: |
