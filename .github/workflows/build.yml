@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: '目标架构 (格式：x86/64 或 armvirt/64)'
+        description: '目标架构 (x86/64 或 armvirt/64)'
         required: true
         default: 'x86/64'
       firmware_version:
-        description: 'OpenWrt 版本号'
+        description: 'OpenWrt 版本 (如 23.05.5)'
         required: true
         default: '23.05.5'
       clash_core_version:
@@ -22,7 +22,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-20.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
     - name: 检出仓库
@@ -31,7 +31,7 @@ jobs:
     - name: 安装依赖工具链
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
           build-essential ccache ecj fastjar file g++ gawk gettext git \
           libelf-dev libncurses5-dev libncursesw5-dev libssl-dev python3 \
           python3-distutils python3-setuptools unzip wget rsync subversion \
@@ -39,135 +39,156 @@ jobs:
 
     - name: 设置 Python 环境
       run: |
-        sudo ln -sf /usr/bin/python3 /usr/bin/python
+        sudo rm /usr/bin/python
+        sudo ln -s /usr/bin/python3 /usr/bin/python
         python --version
 
     - name: 解析目标参数
       id: parse_target
       run: |
-        # 转换架构格式 x86/64 → x86-64
         TARGET_SLUG=$(echo "${{ github.event.inputs.target }}" | sed 's/\//-/g')
         echo "TARGET_SLUG=$TARGET_SLUG" >> $GITHUB_OUTPUT
         
-        # 提取架构类型
         case "${{ github.event.inputs.target }}" in
-          "x86/64")   ARCH_TYPE="amd64"  ;;
-          "armvirt/64") ARCH_TYPE="arm64" ;;
-          *)
-            echo "::error::不支持的架构类型"
-            exit 1
-            ;;
+          "x86/64")    ARCH="amd64"  ;;
+          "armvirt/64") ARCH="arm64" ;;
+          *) echo "::error::不支持的架构"; exit 1 ;;
         esac
-        echo "ARCH_TYPE=$ARCH_TYPE" >> $GITHUB_OUTPUT
+        echo "ARCH=$ARCH" >> $GITHUB_OUTPUT
 
     - name: 下载 OpenWrt SDK
       run: |
         SDK_BASE="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
-        echo "🛠️ SDK 下载目录: $SDK_BASE"
+        echo "🛠️ SDK 基地址: $SDK_BASE"
 
-        # 动态生成匹配模式
-        case "${{ github.event.inputs.target }}" in
-          "x86/64")
-            PATTERN='openwrt-sdk-.*-x86-64.*\.tar\.xz'
-            ;;
-          "armvirt/64")
-            PATTERN='openwrt-sdk-.*-armvirt-64.*\.tar\.xz'
-            ;;
-        esac
+        # 精确匹配 SDK 文件名
+        SDK_FILE=$(curl -sL "$SDK_BASE" | grep -oP 'openwrt-sdk-[\d\.]+-\w+-\d+.*?(?=")\.tar\.xz' | head -n1)
+        if [ -z "$SDK_FILE" ]; then
+          echo "::error::❌ 未找到 SDK 文件，请检查地址: $SDK_BASE"
+          exit 1
+        fi
+        echo "✅ 确认 SDK 文件: $SDK_FILE"
 
-        # 提取 SDK 文件名
-        SDK_FILE=$(curl -s "$SDK_BASE" | grep -oP "$PATTERN" | head -n1)
-        echo "🔍 匹配到的 SDK 文件: $SDK_FILE"
+        # 完整 URL 构建
+        FULL_URL="${SDK_BASE}${SDK_FILE}"
+        echo "🔗 下载地址: $FULL_URL"
 
-        # 下载并解压
-        wget --progress=dot:giga "${SDK_BASE}${SDK_FILE}" -O openwrt-sdk.tar.xz
-        mkdir -p openwrt
-        tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
+        # 带重试的下载
+        for i in {1..3}; do
+          if wget -q --show-progress --progress=bar:force:noscroll "$FULL_URL" -O sdk.tar.xz; then
+            echo "✅ 下载成功"
+            break
+          else
+            echo "⚠️ 第 $i 次下载失败，正在重试..."
+            sleep 5
+          fi
+        done
+
+        # 解压校验
+        if ! tar -xJf sdk.tar.xz -C openwrt --strip-components 1; then
+          echo "::error::❌ SDK 文件损坏，请检查: $FULL_URL"
+          exit 1
+        fi
+        rm sdk.tar.xz
 
     - name: 准备插件源码
       working-directory: openwrt/package
       run: |
-        git clone --depth 1 https://github.com/lj8812/OpenClash ${{ env.PLUGIN_NAME }}
+        git clone --depth 1 --branch master https://github.com/vernesong/OpenClash.git ${{ env.PLUGIN_NAME }}
         
         cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
-        sed -i 's/^    /\t/g' Makefile
-        sed -i 's/\r$//' Makefile
+        # 修复 Makefile 格式
+        sed -i -e 's/^    /\t/g' -e 's/\r$//' Makefile
 
         # 预置 Clash.Meta 内核
-        mkdir -p files/etc/openclash/core
-        CORE_URL="https://github.com/MetaCubeX/Clash.Meta/releases/download/${{ github.event.inputs.clash_core_version }}/clash.meta-linux-${{ steps.parse_target.outputs.ARCH_TYPE }}.gz"
+        CORE_DIR="files/etc/openclash/core"
+        mkdir -p $CORE_DIR
+        CORE_PREFIX="clash.meta"
         
-        # 备用链接检测
-        if ! wget -q --spider "$CORE_URL"; then
-          ALT_CORE_URL="https://github.com/MetaCubeX/Clash.Meta/releases/download/${{ github.event.inputs.clash_core_version }}/clash.meta-${{ steps.parse_target.outputs.ARCH_TYPE }}.gz"
-          echo "⚠️ 使用备用链接: $ALT_CORE_URL"
-          CORE_URL="$ALT_CORE_URL"
-        fi
+        # 动态生成下载 URL
+        CORE_URLS=(
+          "https://github.com/MetaCubeX/Clash.Meta/releases/download/${{ github.event.inputs.clash_core_version }}/$CORE_PREFIX-linux-${{ steps.parse_target.outputs.ARCH }}.gz"
+          "https://github.com/MetaCubeX/Clash.Meta/releases/download/${{ github.event.inputs.clash_core_version }}/$CORE_PREFIX-${{ steps.parse_target.outputs.ARCH }}.gz"
+        )
 
-        wget -q --show-progress "$CORE_URL" -O clash.gz
-        gunzip clash.gz
-        mv clash files/etc/openclash/core/
-        chmod +x files/etc/openclash/core/clash
+        for url in "${CORE_URLS[@]}"; do
+          echo "🔍 尝试下载: $url"
+          if wget -q --spider "$url"; then
+            echo "✅ 有效链接: $url"
+            wget -q --show-progress "$url" -O clash.gz
+            gunzip clash.gz && break
+          fi
+        done
+
+        mv clash $CORE_DIR/
+        chmod 755 $CORE_DIR/clash
 
         # 禁用自动更新
-        sed -i 's/option auto_update .*/option auto_update "0"/' root/etc/config/openclash
-        sed -i 's/option release_branch .*/option release_branch "disabled"/' root/etc/config/openclash
+        CONFIG_FILE="root/etc/config/openclash"
+        sed -i -e 's/option auto_update .*/option auto_update "0"/' \
+               -e 's/option release_branch .*/option release_branch "disabled"/' $CONFIG_FILE
 
     - name: 配置编译环境
       working-directory: openwrt
       run: |
-        TARGET_CONFIG="CONFIG_TARGET_$(echo '${{ github.event.inputs.target }}' | tr / _)"
-        echo "$TARGET_CONFIG=y" > .config
-        echo "CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m" >> .config
-        echo "CONFIG_PACKAGE_dnsmasq-full=y" >> .config
-        echo "CONFIG_PACKAGE_iptables-mod-tproxy=y" >> .config
-        echo "CONFIG_PACKAGE_luci-compat=y" >> .config
+        cat << EOF > .config
+        CONFIG_TARGET_$(echo ${{ github.event.inputs.target }} | tr '/a-z' '_A-Z')=y
+        CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m
+        CONFIG_PACKAGE_dnsmasq-full=y
+        CONFIG_PACKAGE_iptables-mod-tproxy=y
+        CONFIG_PACKAGE_luci-compat=y
+        EOF
+        
         make defconfig
+        grep -r "CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}" .config
 
     - name: 执行编译
       working-directory: openwrt
       run: |
-        export PATH=$PATH:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin
-        make -j$(nproc) package/${{ env.PLUGIN_NAME }}/compile V=s
-
-    - name: 生成时间戳
-      id: get_timestamp
-      run: echo "DATE=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
-
-    - name: 打包输出文件
-      run: |
-        mkdir -p artifacts
-        find openwrt/bin/packages -name "${{ env.PLUGIN_NAME }}*.ipk" -exec cp -v {} artifacts/ \;
+        export PATH="$PATH:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin"
+        make -j$(($(nproc) + 1)) package/${{ env.PLUGIN_NAME }}/compile V=sc 2>&1 | tee build.log
         
-        cd artifacts
-        for f in *.ipk; do
-          NEW_NAME="openclash_${{ steps.parse_target.outputs.TARGET_SLUG }}_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}.ipk"
-          mv "$f" "$NEW_NAME"
-        done
+        # 编译结果检查
+        if ! grep -q "package/${{ env.PLUGIN_NAME }}/compile: Finished" build.log; then
+          echo "::error::❌ 编译失败，查看日志:"
+          cat build.log | grep error:
+          exit 1
+        fi
+
+    - name: 打包输出
+      run: |
+        ARTIFACT_DIR="openclash_${{ steps.parse_target.outputs.TARGET_SLUG }}_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}"
+        mkdir -p $ARTIFACT_DIR
+        
+        find openwrt/bin/packages -name "*.ipk" -exec cp -v {} $ARTIFACT_DIR/ \;
+        echo "📦 生成文件列表:"
+        ls -lh $ARTIFACT_DIR
 
     - name: 上传制品
       uses: actions/upload-artifact@v4
       with:
         name: openclash-packages
-        path: artifacts/*.ipk
+        path: |
+          openclash_*
+          !*.tmp
         retention-days: 7
 
-    - name: 创建 GitHub Release
+    - name: 创建 Release
       uses: softprops/action-gh-release@v2
-      with:
-        files: artifacts/*.ipk
-        tag_name: openclash-${{ steps.parse_target.outputs.TARGET_SLUG }}-${{ github.event.inputs.firmware_version }}-${{ github.event.inputs.clash_core_version }}
-        name: OpenClash ${{ github.event.inputs.clash_core_version }} (${{ github.event.inputs.target }})
-        body: |
-          ### 📦 编译信息
-          - ​**目标架构**: `${{ github.event.inputs.target }}`
-          - ​**OpenWrt 版本**: `${{ github.event.inputs.firmware_version }}`
-          - ​**Clash.Meta 版本**: `${{ github.event.inputs.clash_core_version }}`
-          - ​**编译时间**: `${{ steps.get_timestamp.outputs.DATE }}`
-
-          ### ⚠️ 重要说明
-          - 预置 [Clash.Meta](https://github.com/MetaCubeX/Clash.Meta) 内核
-          - 默认禁用自动更新
-          - 支持 TCP/UDP 流量透明代理
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: openclash-${{ steps.parse_target.outputs.TARGET_SLUG }}-${{ github.event.inputs.firmware_version }}
+        name: OpenClash ${{ github.event.inputs.clash_core_version }} (${{ github.event.inputs.target }})
+        body: |
+          ### 🚀 编译信息
+          - ​**架构**: `${{ github.event.inputs.target }}`
+          - ​**OpenWrt**: ${{ github.event.inputs.firmware_version }}
+          - ​**Clash.Meta**: ${{ github.event.inputs.clash_core_version }}
+          - ​**编译时间**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          ### 📥 安装说明
+          ```bash
+          opkg install luci-app-openclash_*.ipk
+          ```
+        files: openclash_*/*.ipk
