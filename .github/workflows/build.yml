@@ -54,13 +54,14 @@ jobs:
         SDK_BASE="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
         echo "SDK 下载地址: $SDK_BASE"
         
-        # 动态生成正则表达式
+        # 动态生成精确匹配模式
         if [[ "${{ github.event.inputs.target }}" == "x86/64" ]]; then
-          PATTERN='openwrt-sdk-.*-x86-64_gcc-.*_Linux-x86_64.tar.xz'
+          PATTERN='openwrt-sdk-\d+\.\d+\.\d+-x86-64_gcc-\d+\.\d+\.\d+_musl\.Linux-x86_64\.tar\.xz'
         elif [[ "${{ github.event.inputs.target }}" == "armvirt/64" ]]; then
-          PATTERN='openwrt-sdk-.*-armvirt-64-gcc-.*_Linux-x86_64.tar.xz'
+          PATTERN='openwrt-sdk-\d+\.\d+\.\d+-armvirt-64-gcc-\d+\.\d+\.\d+_musl\.Linux-x86_64\.tar\.xz'
         fi
 
+        echo "使用正则表达式模式: $PATTERN"
         SDK_FILE=$(curl -s "$SDK_BASE" | grep -oP "$PATTERN" | head -n1)
         echo "匹配到的 SDK 文件: $SDK_FILE"
         
@@ -70,17 +71,18 @@ jobs:
         fi
         
         echo "开始下载: ${SDK_BASE}${SDK_FILE}"
-        wget "${SDK_BASE}${SDK_FILE}" -O openwrt-sdk.tar.xz
+        wget -q --show-progress "${SDK_BASE}${SDK_FILE}" -O openwrt-sdk.tar.xz
         
         mkdir -p openwrt
         echo "解压 SDK 文件..."
         tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
         echo "SDK 准备完成"
+        ls -lh openwrt
 
     - name: 克隆插件源码
       working-directory: openwrt/package
       run: |
-        git clone --depth 1 https://github.com/vernesong/OpenClash ${{ env.PLUGIN_NAME }}
+        git clone --depth 1 https://github.com/lj8812/OpenClash ${{ env.PLUGIN_NAME }}
         cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
         
         # 修复 Makefile 格式
@@ -103,7 +105,7 @@ jobs:
         esac
         
         echo "下载内核: $CORE_URL"
-        wget -q "$CORE_URL" -O clash.gz
+        wget -q --show-progress "$CORE_URL" -O clash.gz
         gunzip clash.gz
         mv clash files/etc/openclash/core/
         chmod +x files/etc/openclash/core/clash
