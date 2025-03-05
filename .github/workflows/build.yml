@@ -1,42 +1,32 @@
-name: OpenClash Stable Builder
+name: OpenClash 精准编译
 
 on:
-  push:
-    paths:
-      - '**.yml'
-      - '**.yaml'
-    branches: [ "main", "master" ]
-
   workflow_dispatch:
     inputs:
-      target:
-        description: '目标架构 (示例: x86/64)'
-        required: true
-        default: 'x86/64'
       firmware_version:
         description: 'OpenWrt版本'
         required: true
         default: '23.05.5'
       clash_core:
-        description: 'Mihomo核心版本 (带v前缀)'
+        description: 'Mihomo核心版本'
         required: true
         default: 'v1.18.0'
 
 env:
   PLUGIN_NAME: luci-app-openclash
+  TARGET: "x86/64"  # 固定目标架构
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
-    # ===================== 初始化环境 =====================
+    # ===================== 初始化阶段 =====================
     - name: 🛠️ 初始化工作区
-      id: init
       run: |
         BUILD_DIR="${{ github.workspace }}/openwrt-build"
-        CACHE_DIR="${{ runner.temp }}/sdk_cache"
+        CACHE_DIR="/tmp/sdk_cache"
         mkdir -p $BUILD_DIR $CACHE_DIR
         echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
         echo "CACHE_DIR=$CACHE_DIR" >> $GITHUB_ENV
@@ -46,113 +36,78 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          aria2 xz-utils ccache \
-          build-essential git python3 \
-          libncurses-dev zlib1g-dev
+          aria2 xz-utils \
+          build-essential git python3
 
-    # ===================== 参数预处理 =====================
-    - name: 🔍 架构参数转换
+    # ===================== 精确下载SDK =====================
+    - name: 🌐 四级保障下载
       run: |
-        # 转换架构格式 (x86/64 → x86-64)
-        SAFE_TARGET="${{ inputs.target }}" 
-        SAFE_TARGET="${SAFE_TARGET//\//-}"
+        # 固定参数配置
+        FW_VER="${{ inputs.firmware_version }}"
+        SAFE_TARGET="x86-64"  # 硬编码转换结果
+        SDK_FILE="openwrt-sdk-${FW_VER}-${SAFE_TARGET}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
         
-        # 提取主版本号 (23.05.5 → 23.05)
-        FW_MAJOR="${{ inputs.firmware_version }}"
-        FW_MAJOR="${FW_MAJOR%.*}"
-        
-        echo "SAFE_TARGET=$SAFE_TARGET" >> $GITHUB_ENV
-        echo "FW_MAJOR=$FW_MAJOR" >> $GITHUB_ENV
-
-    # ===================== 智能下载SDK =====================
-    - name: 🌐 四重保障下载
-      run: |
-        # 镜像源优先级列表
-        MIRRORS=(
-          "https://downloads.openwrt.org"                  # 官方源
-          "https://op.supes.top/downloads"                # 社区推荐源
-          "https://mirror.ghproxy.com/https://downloads.openwrt.org" # GitHub加速
-          "https://mirror.sjtu.edu.cn/openwrt"            # 上海交大镜像
-        )
-
-        # 文件名匹配模式
-        PATTERNS=(
-          "openwrt-sdk-${{ inputs.firmware_version }}-${SAFE_TARGET}_*"
-          "openwrt-sdk-${FW_MAJOR}-*-${SAFE_TARGET}_*"
-          "openwrt-sdk-*-${SAFE_TARGET}-*_Linux-x86_64.tar.xz"
+        # 下载源列表（优先级排序）
+        DOWNLOAD_SOURCES=(
+          "https://downloads.openwrt.org/releases/${FW_VER}/targets/x86/64/${SDK_FILE}"
+          "https://mirror.ghproxy.com/https://downloads.openwrt.org/releases/${FW_VER}/targets/x86/64/${SDK_FILE}"
+          "https://op.supes.top/${SDK_FILE}"
+          "https://mirror.sjtu.edu.cn/openwrt/releases/${FW_VER}/targets/x86/64/${SDK_FILE}"
         )
 
         # 多级下载尝试
-        for mirror in "${MIRRORS[@]}"; do
-          for pattern in "${PATTERNS[@]}"; do
-            url="${mirror}/releases/${{ inputs.firmware_version }}/targets/${{ inputs.target }}/${pattern}"
-            echo "🔗 尝试下载: ${url}"
-            
-            if aria2c \
-              --max-tries=3 \
-              --retry-wait=30 \
-              --timeout=600 \
-              --allow-overwrite=true \
-              -d "${CACHE_DIR}" \
-              -o "sdk_temp.tar.xz" \
-              "${url}"; then
+        for url in "${DOWNLOAD_SOURCES[@]}"; do
+          echo "🔗 尝试下载: $url"
+          
+          # 使用 aria2c 下载（3次重试）
+          if aria2c \
+            --max-tries=3 \
+            --retry-wait=30 \
+            --timeout=600 \
+            --allow-overwrite=true \
+            --file-allocation=none \
+            -d "$CACHE_DIR" \
+            -o "$SDK_FILE" \
+            "$url"; then
 
-              if xz -T0 -t "${CACHE_DIR}/sdk_temp.tar.xz"; then
-                mv "${CACHE_DIR}/sdk_temp.tar.xz" "${CACHE_DIR}/sdk_${SAFE_TARGET}.tar.xz"
-                echo "✅ 下载成功: ${url##*/}"
-                exit 0
-              else
-                echo "⚠️ 文件校验失败，继续尝试..."
-                rm -f "${CACHE_DIR}/sdk_temp.tar.xz"
-              fi
-            fi
-          done
-        done
-
-        # 终极备用方案
-        echo "⚡ 启用 GitHub 仓库备份..."
-        GH_BACKUP=(
-          "https://raw.githubusercontent.com/openwrt-mirror/sdk-mirror/main/${{ inputs.firmware_version }}/${SAFE_TARGET}.tar.xz"
-          "https://op.dllkit.xyz/sdk/${{ inputs.firmware_version }}/${SAFE_TARGET}.tar.xz"
-        )
-
-        for url in "${GH_BACKUP[@]}"; do
-          if curl -L --retry 3 -o "${CACHE_DIR}/sdk_temp.tar.xz" "${url}"; then
-            if xz -t "${CACHE_DIR}/sdk_temp.tar.xz"; then
-              mv "${CACHE_DIR}/sdk_temp.tar.xz" "${CACHE_DIR}/sdk_${SAFE_TARGET}.tar.xz"
-              echo "✅ 备用源下载成功"
+            # 严格校验文件
+            if xz -T0 -t "$CACHE_DIR/$SDK_FILE"; then
+              echo "✅ 下载验证成功"
               exit 0
+            else
+              echo "⚠️ 文件损坏，删除重试..."
+              rm -f "$CACHE_DIR/$SDK_FILE"
             fi
           fi
+          sleep 10  # 间隔10秒重试
         done
 
-        echo "::error::❌ 所有下载方式均失败！请检查："
-        echo "1. 官方目录是否存在: https://downloads.openwrt.org/releases/${{ inputs.firmware_version }}/targets/${{ inputs.target }}/"
-        echo "2. 版本号是否有效 (示例: 23.05.5)"
-        echo "3. 架构格式是否正确 (示例: x86/64)"
+        echo "::error::❌ 所有下载方式均失败！请手动下载："
+        echo "https://downloads.openwrt.org/releases/${FW_VER}/targets/x86/64/${SDK_FILE}"
         exit 1
 
     # ===================== 准备编译环境 =====================
     - name: 💻 解压SDK
       run: |
-        tar -xJf "${CACHE_DIR}/sdk_${SAFE_TARGET}.tar.xz" -C $BUILD_DIR --strip-components=1
+        tar -xJf "$CACHE_DIR/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz" \
+          -C $BUILD_DIR --strip-components=1
 
     - name: 📂 获取插件源码
       run: |
         cd $BUILD_DIR
-        git clone --filter=blob:none --branch master \
-          https://github.com/vernesong/OpenClash package/${PLUGIN_NAME}
+        git clone --depth 1 --branch master \
+          https://github.com/vernesong/OpenClash package/$PLUGIN_NAME
         
-        # 自动修复Makefile缩进
-        find package/${PLUGIN_NAME} -name Makefile -exec sed -i 's/^    /\t/g' {} +
+        # 强制修复Makefile格式
+        find package/$PLUGIN_NAME -name Makefile -exec sed -i 's/^    /\t/g' {} +
 
     # ===================== 编译配置 =====================
     - name: ⚙️ 生成配置
       run: |
         cd $BUILD_DIR
         cat > .config <<EOF
-        CONFIG_TARGET_${SAFE_TARGET//-/_}=y
-        CONFIG_PACKAGE_${PLUGIN_NAME}=m
+        CONFIG_TARGET_x86_64=y
+        CONFIG_PACKAGE_$PLUGIN_NAME=m
         CONFIG_PACKAGE_luci-compat=y
         EOF
         make defconfig
@@ -163,8 +118,7 @@ jobs:
         cd $BUILD_DIR
         make -j$(($(nproc) + 2)) \
           V=sc \
-          CONFIG_DEBUG_SECTION_MISMATCH=y \
-          package/${PLUGIN_NAME}/compile
+          package/$PLUGIN_NAME/compile
 
     # ===================== 发布结果 =====================
     - name: 🚀 发布Release
@@ -173,25 +127,17 @@ jobs:
         files: |
           $BUILD_DIR/bin/packages/**/*.ipk
         tag_name: openclash-${{ inputs.clash_core }}-$(date +%Y%m%d)
-        name: OpenClash ${{ inputs.clash_core }} Build
         body: |
           ### 编译信息
-          | 项目          | 值                       |
-          |--------------|--------------------------|
-          | 目标架构      | `${{ inputs.target }}`   |
-          | OpenWrt版本   | `${{ inputs.firmware_version }}` |
-          | 核心版本      | `${{ inputs.clash_core }}` |
-          | 编译时间      | `$(date -u +"%Y-%m-%dT%H:%M:%SZ")` |
-
-          ### 文件校验
-          ```bash
-          sha256sum *.ipk
-          ```
+          - ​**架构**: x86/64
+          - ​**OpenWrt版本**: ${{ inputs.firmware_version }}
+          - ​**核心版本**: ${{ inputs.clash_core }}
+          - ​**编译时间**: `$(date -u +"%Y-%m-%dT%H:%M:%SZ")`
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    # ===================== 失败通知 =====================
-    - name: 🚨 构建失败通知
+    # ===================== 错误通知 =====================
+    - name: 🚨 失败通知
       if: ${{ failure() }}
       uses: actions/github-script@v6
       with:
@@ -200,7 +146,6 @@ jobs:
             issue_number: context.issue.number,
             owner: context.repo.owner,
             repo: context.repo.repo,
-            body: `❗️ 构建失败!\n
-              失败步骤: ${{ join(toJson(steps.*.outcome)) }}\n
-              完整日志: ${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            body: `❗️ 编译失败！错误详情：\n
+              ${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
           })
