@@ -1,4 +1,4 @@
-name: OpenClash 精准编译
+name: OpenClash 稳定编译
 
 on:
   workflow_dispatch:
@@ -14,16 +14,16 @@ on:
 
 env:
   PLUGIN_NAME: luci-app-openclash
-  TARGET: "x86/64"  # 固定目标架构
+  TARGET: "x86/64"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
     # ===================== 初始化阶段 =====================
-    - name: 🛠️ 初始化工作区
+    - name: 🛠️ 初始化环境
       run: |
         BUILD_DIR="${{ github.workspace }}/openwrt-build"
         CACHE_DIR="/tmp/sdk_cache"
@@ -31,59 +31,57 @@ jobs:
         echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
         echo "CACHE_DIR=$CACHE_DIR" >> $GITHUB_ENV
 
-    # ===================== 安装工具链 =====================
-    - name: 📦 安装编译工具
+    # ===================== 安装基础依赖 =====================
+    - name: 📥 安装编译工具链
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          aria2 xz-utils \
-          build-essential git python3
+          aria2 xz-utils ccache \
+          build-essential git python3 \
+          libncurses-dev zlib1g-dev \
+          lua5.1 liblua5.1-0-dev
 
-    # ===================== 精确下载SDK =====================
-    - name: 🌐 四级保障下载
+    # ===================== 修复 LuCI 工具链 =====================
+    - name: 🔧 安装 LuCI 依赖
       run: |
-        # 固定参数配置
+        # 安装运行时依赖
+        sudo apt-get install -y \
+          luci-base \
+          luci-i18n-base-en \
+          lua-filesystem
+
+        # 手动编译 po2lmo
+        git clone --depth 1 https://github.com/openwrt/luci.git
+        cd luci
+        make tools/install -j$(nproc)
+        sudo cp staging_dir/host/bin/po2lmo /usr/local/bin/
+        sudo chmod +x /usr/local/bin/po2lmo
+        echo "✅ po2lmo 安装完成：$(which po2lmo)"
+
+    # ===================== 下载SDK核心 =====================
+    - name: 🌐 多源下载SDK
+      run: |
         FW_VER="${{ inputs.firmware_version }}"
-        SAFE_TARGET="x86-64"  # 硬编码转换结果
+        SAFE_TARGET="x86-64"
         SDK_FILE="openwrt-sdk-${FW_VER}-${SAFE_TARGET}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
         
-        # 下载源列表（优先级排序）
-        DOWNLOAD_SOURCES=(
+        MIRRORS=(
           "https://downloads.openwrt.org/releases/${FW_VER}/targets/x86/64/${SDK_FILE}"
           "https://mirror.ghproxy.com/https://downloads.openwrt.org/releases/${FW_VER}/targets/x86/64/${SDK_FILE}"
           "https://op.supes.top/${SDK_FILE}"
-          "https://mirror.sjtu.edu.cn/openwrt/releases/${FW_VER}/targets/x86/64/${SDK_FILE}"
         )
 
-        # 多级下载尝试
-        for url in "${DOWNLOAD_SOURCES[@]}"; do
+        for url in "${MIRRORS[@]}"; do
           echo "🔗 尝试下载: $url"
-          
-          # 使用 aria2c 下载（3次重试）
-          if aria2c \
-            --max-tries=3 \
-            --retry-wait=30 \
-            --timeout=600 \
-            --allow-overwrite=true \
-            --file-allocation=none \
-            -d "$CACHE_DIR" \
-            -o "$SDK_FILE" \
-            "$url"; then
-
-            # 严格校验文件
-            if xz -T0 -t "$CACHE_DIR/$SDK_FILE"; then
+          if aria2c -x8 --file-allocation=none -d "$CACHE_DIR" -o "$SDK_FILE" "$url"; then
+            if xz -t "$CACHE_DIR/$SDK_FILE"; then
               echo "✅ 下载验证成功"
               exit 0
-            else
-              echo "⚠️ 文件损坏，删除重试..."
-              rm -f "$CACHE_DIR/$SDK_FILE"
             fi
+            rm -f "$CACHE_DIR/$SDK_FILE"
           fi
-          sleep 10  # 间隔10秒重试
         done
-
-        echo "::error::❌ 所有下载方式均失败！请手动下载："
-        echo "https://downloads.openwrt.org/releases/${FW_VER}/targets/x86/64/${SDK_FILE}"
+        echo "::error::❌ 所有下载源均不可用"
         exit 1
 
     # ===================== 准备编译环境 =====================
@@ -92,14 +90,16 @@ jobs:
         tar -xJf "$CACHE_DIR/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz" \
           -C $BUILD_DIR --strip-components=1
 
-    - name: 📂 获取插件源码
+    - name: 📂 准备插件源码
       run: |
         cd $BUILD_DIR
         git clone --depth 1 --branch master \
           https://github.com/vernesong/OpenClash package/$PLUGIN_NAME
         
-        # 强制修复Makefile格式
+        # 修复Makefile格式
         find package/$PLUGIN_NAME -name Makefile -exec sed -i 's/^    /\t/g' {} +
+        # 预转换语言文件
+        (cd package/$PLUGIN_NAME && po2lmo po/zh-cn/openclash.zh-cn.po openclash.zh-cn.lmo)
 
     # ===================== 编译配置 =====================
     - name: ⚙️ 生成配置
@@ -107,21 +107,22 @@ jobs:
         cd $BUILD_DIR
         cat > .config <<EOF
         CONFIG_TARGET_x86_64=y
-        CONFIG_PACKAGE_$PLUGIN_NAME=m
+        CONFIG_PACKAGE_${PLUGIN_NAME}=m
         CONFIG_PACKAGE_luci-compat=y
         EOF
         make defconfig
 
     # ===================== 执行编译 =====================
-    - name: 🏭 开始编译
+    - name: 🏭 核心编译流程
       run: |
         cd $BUILD_DIR
         make -j$(($(nproc) + 2)) \
           V=sc \
+          CONFIG_DEBUG_SECTION_MISMATCH=y \
           package/$PLUGIN_NAME/compile
 
-    # ===================== 发布结果 =====================
-    - name: 🚀 发布Release
+    # ===================== 发布管理 =====================
+    - name: 🚀 发布制品
       uses: softprops/action-gh-release@v2
       with:
         files: |
@@ -136,7 +137,7 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    # ===================== 错误通知 =====================
+    # ===================== 错误处理 =====================
     - name: 🚨 失败通知
       if: ${{ failure() }}
       uses: actions/github-script@v6
@@ -146,6 +147,5 @@ jobs:
             issue_number: context.issue.number,
             owner: context.repo.owner,
             repo: context.repo.repo,
-            body: `❗️ 编译失败！错误详情：\n
-              ${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            body: `⚠️ 编译失败！错误详情：\n${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
           })
