@@ -12,9 +12,9 @@ on:
         required: true
         default: '23.05.5'
       clash_core_version:
-        description: 'Clash 内核版本'
+        description: 'Clash 内核版本 (带 v 前缀)'
         required: true
-        default: '2024.05.01'
+        default: 'v2024.05.01'
 
 env:
   PLUGIN_NAME: luci-app-openclash
@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-    - name: 检出代码
+    - name: 检出仓库
       uses: actions/checkout@v4
 
     - name: 安装编译依赖
@@ -56,12 +56,14 @@ jobs:
         
         # 动态生成精确匹配模式
         if [[ "${{ github.event.inputs.target }}" == "x86/64" ]]; then
-          PATTERN='openwrt-sdk-\d+\.\d+\.\d+-x86-64_gcc-\d+\.\d+\.\d+_musl\.Linux-x86_64\.tar\.xz'
+          PATTERN='openwrt-sdk-.*-x86-64_gcc-.*_musl\.Linux-x86_64\.tar\.xz'
         elif [[ "${{ github.event.inputs.target }}" == "armvirt/64" ]]; then
-          PATTERN='openwrt-sdk-\d+\.\d+\.\d+-armvirt-64-gcc-\d+\.\d+\.\d+_musl\.Linux-x86_64\.tar\.xz'
+          PATTERN='openwrt-sdk-.*-armvirt-64-gcc-.*_musl\.Linux-x86_64\.tar\.xz'
+        else
+          echo "::error::不支持的架构类型"
+          exit 1
         fi
 
-        echo "使用正则表达式模式: $PATTERN"
         SDK_FILE=$(curl -s "$SDK_BASE" | grep -oP "$PATTERN" | head -n1)
         echo "匹配到的 SDK 文件: $SDK_FILE"
         
@@ -70,16 +72,13 @@ jobs:
           exit 1
         fi
         
-        echo "开始下载: ${SDK_BASE}${SDK_FILE}"
-        wget -q --show-progress "${SDK_BASE}${SDK_FILE}" -O openwrt-sdk.tar.xz
-        
+        wget "${SDK_BASE}${SDK_FILE}" -O openwrt-sdk.tar.xz
         mkdir -p openwrt
-        echo "解压 SDK 文件..."
         tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
-        echo "SDK 准备完成"
+        echo "SDK 解压完成，目录结构:"
         ls -lh openwrt
 
-    - name: 克隆插件源码
+    - name: 准备插件源码
       working-directory: openwrt/package
       run: |
         git clone --depth 1 https://github.com/lj8812/OpenClash ${{ env.PLUGIN_NAME }}
@@ -93,19 +92,22 @@ jobs:
         mkdir -p files/etc/openclash/core
         case "${{ steps.parse_target.outputs.ARCH }}" in
           "64")
-            CORE_URL="https://release.dreamacro.workers.dev/${{ github.event.inputs.clash_core_version }}/clash-linux-amd64-${{ github.event.inputs.clash_core_version }}.gz"
+            CORE_URL="https://github.com/Dreamacro/clash/releases/download/${{ github.event.inputs.clash_core_version }}/clash-linux-amd64-${{ github.event.inputs.clash_core_version }}.gz"
             ;;
           "armv8")
-            CORE_URL="https://release.dreamacro.workers.dev/${{ github.event.inputs.clash_core_version }}/clash-linux-arm64-${{ github.event.inputs.clash_core_version }}.gz"
+            CORE_URL="https://github.com/Dreamacro/clash/releases/download/${{ github.event.inputs.clash_core_version }}/clash-linux-arm64-${{ github.event.inputs.clash_core_version }}.gz"
             ;;
           *)
             echo "::error::不支持的架构: ${{ steps.parse_target.outputs.ARCH }}"
             exit 1
             ;;
         esac
-        
+
         echo "下载内核: $CORE_URL"
-        wget -q --show-progress "$CORE_URL" -O clash.gz
+        if ! wget -q --show-progress "$CORE_URL" -O clash.gz; then
+          echo "::error::内核下载失败"
+          exit 1
+        fi
         gunzip clash.gz
         mv clash files/etc/openclash/core/
         chmod +x files/etc/openclash/core/clash
@@ -125,24 +127,23 @@ jobs:
         echo "CONFIG_PACKAGE_luci-compat=y" >> .config
         make defconfig
 
-    - name: 编译插件
+    - name: 执行编译
       working-directory: openwrt
       run: |
         export PATH=$PATH:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin
         make -j$(nproc) package/${{ env.PLUGIN_NAME }}/compile V=s
 
-    - name: 获取时间戳
+    - name: 生成时间戳
       id: get_timestamp
       run: echo "DATE=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
 
-    - name: 打包制品
+    - name: 打包输出文件
       run: |
         mkdir -p artifacts
         find openwrt/bin/packages -name "${{ env.PLUGIN_NAME }}*.ipk" -exec cp -v {} artifacts/ \;
         cd artifacts
         for f in *.ipk; do
           new_name="openclash_$(echo '${{ github.event.inputs.target }}' | tr / -)_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}.ipk"
-          echo "重命名: $f → $new_name"
           mv "$f" "$new_name"
         done
         echo "最终生成文件:"
@@ -155,7 +156,7 @@ jobs:
         path: artifacts/*.ipk
         retention-days: 7
 
-    - name: 创建 GitHub Release
+    - name: 创建版本发布
       if: success()
       uses: softprops/action-gh-release@v2
       with:
@@ -169,9 +170,9 @@ jobs:
           - ​**Clash 内核版本**: `${{ github.event.inputs.clash_core_version }}`
           - ​**编译时间**: `${{ steps.get_timestamp.outputs.DATE }}`
 
-          ### ⚙️ 预置功能
-          ✅ 内置最新 Clash 内核  
-          ✅ 禁用自动更新  
+          ### ⚙️ 功能特性
+          ✅ 预编译内核集成  
+          ✅ 自动更新禁用  
           ✅ 多架构支持
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
