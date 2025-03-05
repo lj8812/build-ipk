@@ -1,134 +1,169 @@
-name: OpenClash Stable Builder
+name: OpenClash AutoBuilder (Stable)
 
 on:
+  push:
+    paths:
+      - '**.yml'
+      - '**.yaml'
+    branches: [ "main", "master" ]
+
   workflow_dispatch:
     inputs:
       target:
-        description: '目标架构 (示例: x86/64)'
+        description: '目标架构 (如 x86/64)'
         required: true
         default: 'x86/64'
       firmware_version:
         description: 'OpenWrt版本'
         required: true
         default: '23.05.5'
+      clash_core:
+        description: 'Mihomo核心版本 (带v前缀)'
+        required: true
+        default: 'v1.18.0'
 
 env:
-  CACHE_DIR: ${{ runner.temp }}/sdk_cache
-  BUILD_DIR: ${{ github.workspace }}/openwrt-build
+  PLUGIN_NAME: luci-app-openclash
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
     steps:
     # ===================== 初始化阶段 =====================
-    - name: 🛠️ 初始化环境
+    - name: 🛠️ 初始化工作区
+      id: init
       run: |
-        mkdir -p "$BUILD_DIR" "$CACHE_DIR"
+        # 定义路径变量（正确使用上下文）
+        BUILD_DIR="${{ github.workspace }}/openwrt-build"
+        CACHE_DIR="${{ runner.temp }}/sdk_cache"
+        mkdir -p $BUILD_DIR $CACHE_DIR
         echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
+        echo "CACHE_DIR=$CACHE_DIR" >> $GITHUB_ENV
 
-    # ===================== 版本解析 =====================
-    - name: 🔍 预处理参数
+    # ===================== 依赖安装 =====================
+    - name: 📥 安装编译工具
       run: |
-        # 转换架构格式 x86/64 → x86-64
-        formatted_target="${INPUT_TARGET//\//-}"
-        # 提取主版本号 23.05.5 → 23.05
-        firmware_major="${INPUT_FIRMWARE_VERSION%.*}"
-        
-        echo "FORMATTED_TARGET=$formatted_target" >> $GITHUB_ENV
-        echo "FIRMWARE_MAJOR=$firmware_major" >> $GITHUB_ENV
+        sudo apt-get update
+        sudo apt-get install -y \
+          aria2 xz-utils ccache \
+          build-essential git python3 \
+          libncurses-dev zlib1g-dev
 
-    # ===================== 下载阶段 =====================
-    - name: 🌐 智能下载SDK
+    # ===================== 参数预处理 =====================
+    - name: 🔍 解析输入参数
+      run: |
+        # 架构参数转换 (x86/64 → x86-64)
+        FORMATTED_TARGET="${{ inputs.target }}" 
+        FORMATTED_TARGET="${FORMATTED_TARGET//\//-}"
+        
+        # 版本参数处理 (23.05.5 → 23.05)
+        FIRMWARE_MAJOR="${{ inputs.firmware_version }}"
+        FIRMWARE_MAJOR="${FIRMWARE_MAJOR%.*}"
+        
+        echo "FORMATTED_TARGET=$FORMATTED_TARGET" >> $GITHUB_ENV
+        echo "FIRMWARE_MAJOR=$FIRMWARE_MAJOR" >> $GITHUB_ENV
+
+    # ===================== SDK下载 =====================
+    - name: 🌐 多源下载SDK
       env:
-        MIRRORS: >
+        MIRROR_LIST: >
           https://downloads.openwrt.org,
           https://mirror.sjtu.edu.cn/openwrt,
           https://mirrors.tuna.tsinghua.edu.cn/openwrt
       run: |
         # 定义文件名匹配模式
-        patterns=(
-          "openwrt-sdk-${INPUT_FIRMWARE_VERSION}-${FORMATTED_TARGET}_*"
+        FILE_PATTERNS=(
+          "openwrt-sdk-${{ inputs.firmware_version }}-${FORMATTED_TARGET}_*"
           "openwrt-sdk-${FIRMWARE_MAJOR}-*-${FORMATTED_TARGET}_*"
         )
 
-        # 多源多模式尝试
-        for mirror in ${MIRRORS//,/ }; do
-          for pattern in "${patterns[@]}"; do
-            full_url="${mirror}/releases/${INPUT_FIRMWARE_VERSION}/targets/${INPUT_TARGET}/${pattern}"
-            echo "🔗 尝试下载: $full_url"
+        # 多级下载尝试
+        for mirror in ${MIRROR_LIST//,/ }; do
+          for pattern in "${FILE_PATTERNS[@]}"; do
+            download_url="${mirror}/releases/${{ inputs.firmware_version }}/targets/${{ inputs.target }}/${pattern}"
+            echo "🔗 尝试下载: ${download_url}"
             
-            if aria2c -x8 -s8 --file-allocation=none -o "$CACHE_DIR/temp.tar.xz" "$full_url"; then
-              if xz -t "$CACHE_DIR/temp.tar.xz"; then
-                mv "$CACHE_DIR/temp.tar.xz" "$CACHE_DIR/sdk.tar.xz"
-                echo "✅ 验证通过: ${full_url##*/}"
+            if aria2c -x8 --retry-wait=15 -o "${CACHE_DIR}/temp.tar.xz" "${download_url}"; then
+              if xz -t "${CACHE_DIR}/temp.tar.xz"; then
+                mv "${CACHE_DIR}/temp.tar.xz" "${CACHE_DIR}/sdk.tar.xz"
+                echo "✅ 下载验证成功"
                 exit 0
               fi
             fi
           done
         done
 
-        echo "::error::所有下载源均失败"
+        # 备用下载方案
+        echo "⚠️ 镜像源失败，尝试GitHub备份..."
+        backup_url="https://ghproxy.com/https://github.com/openwrt/sdk/releases/download/v${{ inputs.firmware_version }}/sdk-${FORMATTED_TARGET}.tar.xz"
+        if curl -L "$backup_url" -o "${CACHE_DIR}/sdk.tar.xz" && xz -t "${CACHE_DIR}/sdk.tar.xz"; then
+          exit 0
+        fi
+
+        echo "::error::所有下载方式均失败"
         exit 1
 
-    # ===================== 后续步骤 =====================
-    # ... [保留原有的编译和发布步骤] ...
-
-    # ===================== 后续步骤 =====================
-    # ... [保留原有的编译和发布步骤] ...
-
     # ===================== 源码准备 =====================
-    - name: 💾 Prepare Source Code
+    - name: 💾 准备插件源码
       run: |
         # 解压SDK
-        tar -xJf "${{ env.CACHE_DIR }}/sdk.tar.xz" -C ${{ env.BUILD_DIR }} --strip-components=1
-
-        # 克隆插件源码
-        cd ${{ env.BUILD_DIR }}
+        tar -xJf "${CACHE_DIR}/sdk.tar.xz" -C $BUILD_DIR --strip-components=1
+        
+        # 克隆源码
+        cd $BUILD_DIR
         git clone --depth 1 --branch master \
-          https://github.com/vernesong/OpenClash package/${{ env.PLUGIN_NAME }}
-
-        # 修复Makefile
-        find package/${{ env.PLUGIN_NAME }} -name Makefile -exec sed -i 's/^    /\t/g' {} +
+          https://github.com/vernesong/OpenClash package/${PLUGIN_NAME}
+        
+        # 自动修复Makefile
+        find package/${PLUGIN_NAME} -name Makefile -exec sed -i 's/^    /\t/g' {} +
 
     # ===================== 编译配置 =====================
-    - name: ⚙️ Configure Build
+    - name: ⚙️ 生成编译配置
       run: |
-        cd ${{ env.BUILD_DIR }}
+        cd $BUILD_DIR
         cat > .config <<EOF
-        CONFIG_TARGET_${TARGET_CFG}=y
-        CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m
+        CONFIG_TARGET_${FORMATTED_TARGET//-/_}=y
+        CONFIG_PACKAGE_${PLUGIN_NAME}=m
         CONFIG_PACKAGE_luci-compat=y
         EOF
         make defconfig
 
     # ===================== 执行编译 =====================
-    - name: 🛠️ Compile Package
+    - name: 🏭 编译插件
       run: |
-        cd ${{ env.BUILD_DIR }}
+        cd $BUILD_DIR
         make -j$(($(nproc) + 2)) \
           V=sc \
           CONFIG_DEBUG_SECTION_MISMATCH=y \
-          package/${{ env.PLUGIN_NAME }}/compile
+          package/${PLUGIN_NAME}/compile
 
     # ===================== 发布产物 =====================
-    - name: 🚀 Create Release
+    - name: 🚀 创建Release
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          ${{ env.BUILD_DIR }}/bin/packages/**/*.ipk
+          $BUILD_DIR/bin/packages/**/*.ipk
         tag_name: openclash-${{ inputs.clash_core }}-$(date +%Y%m%d)
         name: OpenClash ${{ inputs.clash_core }} Build
         body: |
-          ### Build Info
-          - ​**Target**: ${{ inputs.target }}
-          - ​**OpenWrt**: ${{ inputs.firmware_version }}
-          - ​**Core**: ${{ inputs.clash_core }}
-          - ​**Timestamp**: `$(date -u +'%Y-%m-%dT%H:%M:%SZ')`
+          ### 构建信息
+          | 参数          | 值                      |
+          |---------------|-------------------------|
+          | 目标架构      | `${{ inputs.target }}`  |
+          | OpenWrt版本   | `${{ inputs.firmware_version }}` |
+          | 核心版本      | `${{ inputs.clash_core }}` |
+
+          ### 文件清单
+          ```bash
+          $(ls -l $BUILD_DIR/bin/packages/**/*.ipk)
+          ```
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    # ===================== 错误处理 =====================
-    - name: 🚨 Error Notification
+    # ===================== 错误通知 =====================
+    - name: 🚨 构建失败通知
       if: ${{ failure() }}
       uses: actions/github-script@v6
       with:
@@ -137,8 +172,7 @@ jobs:
             issue_number: context.issue.number,
             owner: context.repo.owner,
             repo: context.repo.repo,
-            body: `❗ Build Failed!\n
-              Job: ${context.job}\n
-              Error: ${{ join(toJson(steps.*.conclusion)) }}\n
-              Logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            body: `🚨 构建失败!\n
+              错误步骤: ${{ join(toJson(steps.*.outcome)) }}\n
+              完整日志: ${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
           })
