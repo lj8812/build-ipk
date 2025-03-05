@@ -26,15 +26,15 @@ jobs:
 
     steps:
     - name: 检出代码
-      uses: actions/checkout@v4 # 更新到最新稳定版
-      
+      uses: actions/checkout@v4
+
     - name: 安装编译依赖
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
-        gettext git java-propose-classpath libelf-dev libncurses5-dev \
-        libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
-        unzip wget rsync subversion swig time xsltproc zlib1g-dev tree jq
+        gettext git libelf-dev libncurses5-dev libncursesw5-dev libssl-dev \
+        python3 python3-distutils python3-setuptools unzip wget rsync subversion \
+        swig time xsltproc zlib1g-dev tree jq
 
     - name: 设置 Python 环境
       run: |
@@ -46,28 +46,36 @@ jobs:
       run: |
         TARGET_SLUG=$(echo "${{ github.event.inputs.target }}" | sed 's/\//-/g')
         echo "TARGET_SLUG=$TARGET_SLUG" >> $GITHUB_OUTPUT
-        echo "ARCH=$(echo ${{ github.event.inputs.target }} | cut -d'/' -f2)" >> $GITHUB_OUTPUT
+        ARCH=$(echo "${{ github.event.inputs.target }}" | cut -d'/' -f2)
+        echo "ARCH=$ARCH" >> $GITHUB_OUTPUT
 
-    
-    - name: 下载并解压 OpenWrt 源码
+    - name: 下载 OpenWrt SDK
       run: |
-        SDK_BASE_URL="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
-        SDK_FILE=$(curl -s $SDK_BASE_URL | grep -oP 'openwrt-sdk-.*?-${{ steps.set_target.outputs.TARGET_DASH }}_gcc-.*?Linux-x86_64.tar.xz' | head -n 1)
+        SDK_BASE="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
+        echo "SDK 下载地址: $SDK_BASE"
+        
+        # 动态生成正则表达式
+        if [[ "${{ github.event.inputs.target }}" == "x86/64" ]]; then
+          PATTERN='openwrt-sdk-.*-x86-64_gcc-.*_Linux-x86_64.tar.xz'
+        elif [[ "${{ github.event.inputs.target }}" == "armvirt/64" ]]; then
+          PATTERN='openwrt-sdk-.*-armvirt-64-gcc-.*_Linux-x86_64.tar.xz'
+        fi
+
+        SDK_FILE=$(curl -s "$SDK_BASE" | grep -oP "$PATTERN" | head -n1)
+        echo "匹配到的 SDK 文件: $SDK_FILE"
+        
         if [ -z "$SDK_FILE" ]; then
-          echo "无法找到匹配的 SDK 文件"
+          echo "::error::无法找到匹配的 SDK 文件"
           exit 1
         fi
-        SDK_URL="${SDK_BASE_URL}${SDK_FILE}"
-        echo "下载 SDK: $SDK_URL"
-        wget $SDK_URL -O openwrt.tar.xz
-        mkdir openwrt
-        tar -xJf openwrt.tar.xz -C openwrt --strip-components 1
-    - name: 检查 SDK 下载
-      run: |
-        if [ ! -f openwrt.tar.xz ]; then
-          echo "SDK 下载失败"
-          exit 1
-        fi
+        
+        echo "开始下载: ${SDK_BASE}${SDK_FILE}"
+        wget "${SDK_BASE}${SDK_FILE}" -O openwrt-sdk.tar.xz
+        
+        mkdir -p openwrt
+        echo "解压 SDK 文件..."
+        tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
+        echo "SDK 准备完成"
 
     - name: 克隆插件源码
       working-directory: openwrt/package
@@ -107,7 +115,8 @@ jobs:
     - name: 配置编译环境
       working-directory: openwrt
       run: |
-        echo "CONFIG_TARGET_$(echo '${{ github.event.inputs.target }}' | tr / _)=y" > .config
+        TARGET_CONFIG="CONFIG_TARGET_$(echo '${{ github.event.inputs.target }}' | tr / _)"
+        echo "$TARGET_CONFIG=y" > .config
         echo "CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m" >> .config
         echo "CONFIG_PACKAGE_dnsmasq-full=y" >> .config
         echo "CONFIG_PACKAGE_iptables-mod-tproxy=y" >> .config
@@ -127,31 +136,40 @@ jobs:
     - name: 打包制品
       run: |
         mkdir -p artifacts
-        find openwrt/bin/packages -name "${{ env.PLUGIN_NAME }}*.ipk" -exec cp {} artifacts/ \;
+        find openwrt/bin/packages -name "${{ env.PLUGIN_NAME }}*.ipk" -exec cp -v {} artifacts/ \;
         cd artifacts
         for f in *.ipk; do
           new_name="openclash_$(echo '${{ github.event.inputs.target }}' | tr / -)_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}.ipk"
+          echo "重命名: $f → $new_name"
           mv "$f" "$new_name"
         done
+        echo "最终生成文件:"
+        ls -lh
 
     - name: 上传制品
-      uses: actions/upload-artifact@v4 # 使用最新稳定版本
+      uses: actions/upload-artifact@v4
       with:
         name: openclash-packages
         path: artifacts/*.ipk
+        retention-days: 7
 
     - name: 创建 GitHub Release
       if: success()
-      uses: softprops/action-gh-release@v2 # 更新到最新版本
+      uses: softprops/action-gh-release@v2
       with:
         files: artifacts/*.ipk
         tag_name: openclash-${{ github.event.inputs.target }}-${{ github.event.inputs.firmware_version }}-${{ github.event.inputs.clash_core_version }}
         name: OpenClash ${{ github.event.inputs.clash_core_version }} (${{ github.event.inputs.target }})
         body: |
-          ### 编译信息
-          - ​**目标架构**: ${{ github.event.inputs.target }}
-          - ​**OpenWrt 版本**: ${{ github.event.inputs.firmware_version }}
-          - ​**Clash 内核版本**: ${{ github.event.inputs.clash_core_version }}
-          - ​**编译时间**: ${{ steps.get_timestamp.outputs.DATE }}
+          ### 📦 编译信息
+          - ​**目标架构**: `${{ github.event.inputs.target }}`
+          - ​**OpenWrt 版本**: `${{ github.event.inputs.firmware_version }}`
+          - ​**Clash 内核版本**: `${{ github.event.inputs.clash_core_version }}`
+          - ​**编译时间**: `${{ steps.get_timestamp.outputs.DATE }}`
+
+          ### ⚙️ 预置功能
+          ✅ 内置最新 Clash 内核  
+          ✅ 禁用自动更新  
+          ✅ 多架构支持
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
