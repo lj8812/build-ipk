@@ -48,17 +48,26 @@ jobs:
         echo "TARGET_SLUG=$TARGET_SLUG" >> $GITHUB_OUTPUT
         echo "ARCH=$(echo ${{ github.event.inputs.target }} | cut -d'/' -f2)" >> $GITHUB_OUTPUT
 
-    - name: 下载 OpenWrt SDK
+    
+    - name: 下载并解压 OpenWrt 源码
       run: |
-        SDK_BASE="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
-        SDK_FILE=$(curl -s $SDK_BASE | grep -oP 'openwrt-sdk-.*?_${{ steps.parse_target.outputs.TARGET_SLUG }}_gcc-.*?_Linux-x86_64.tar.xz' | head -n1)
+        SDK_BASE_URL="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
+        SDK_FILE=$(curl -s $SDK_BASE_URL | grep -oP 'openwrt-sdk-.*?-${{ steps.set_target.outputs.TARGET_DASH }}_gcc-.*?Linux-x86_64.tar.xz' | head -n 1)
         if [ -z "$SDK_FILE" ]; then
-          echo "::error::无法找到匹配的 SDK 文件"
+          echo "无法找到匹配的 SDK 文件"
           exit 1
         fi
-        wget "$SDK_BASE/$SDK_FILE" -O openwrt-sdk.tar.xz
+        SDK_URL="${SDK_BASE_URL}${SDK_FILE}"
+        echo "下载 SDK: $SDK_URL"
+        wget $SDK_URL -O openwrt.tar.xz
         mkdir openwrt
-        tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
+        tar -xJf openwrt.tar.xz -C openwrt --strip-components 1
+    - name: 检查 SDK 下载
+      run: |
+        if [ ! -f openwrt.tar.xz ]; then
+          echo "SDK 下载失败"
+          exit 1
+        fi
 
     - name: 克隆插件源码
       working-directory: openwrt/package
