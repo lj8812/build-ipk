@@ -18,7 +18,6 @@ on:
 
 env:
   PLUGIN_NAME: luci-app-openclash
-  PLUGIN_VERSION: ${{ steps.get_version.outputs.VERSION }}
 
 jobs:
   build:
@@ -45,13 +44,13 @@ jobs:
     - name: 解析目标参数
       id: parse_target
       run: |
-        TARGET_SLUG=$(echo "${{ inputs.target }}" | sed 's/\//-/g')
+        TARGET_SLUG=$(echo "${{ github.event.inputs.target }}" | sed 's/\//-/g')
         echo "TARGET_SLUG=$TARGET_SLUG" >> $GITHUB_OUTPUT
-        echo "ARCH=$(echo ${{ inputs.target }} | cut -d'/' -f2)" >> $GITHUB_OUTPUT
+        echo "ARCH=$(echo ${{ github.event.inputs.target }} | cut -d'/' -f2)" >> $GITHUB_OUTPUT
 
     - name: 下载 OpenWrt SDK
       run: |
-        SDK_BASE="https://downloads.openwrt.org/releases/${{ inputs.firmware_version }}/targets/${{ inputs.target }}/"
+        SDK_BASE="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
         SDK_FILE=$(curl -s $SDK_BASE | grep -oP 'openwrt-sdk-.*?_${{ steps.parse_target.outputs.TARGET_SLUG }}_gcc-.*?_Linux-x86_64.tar.xz' | head -n1)
         if [ -z "$SDK_FILE" ]; then
           echo "::error::无法找到匹配的 SDK 文件"
@@ -65,7 +64,7 @@ jobs:
     - name: 克隆插件源码
       working-directory: openwrt/package
       run: |
-        git clone --depth 1 ${{ inputs.plugin_source }} ${{ env.PLUGIN_NAME }}
+        git clone --depth 1 ${{ github.event.inputs.plugin_source }} ${{ env.PLUGIN_NAME }}
         cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
         
         # 修复 Makefile 格式
@@ -76,10 +75,10 @@ jobs:
         mkdir -p files/etc/openclash/core
         case "${{ steps.parse_target.outputs.ARCH }}" in
           "64")
-            CORE_URL="https://release.dreamacro.workers.dev/${{ inputs.clash_core_version }}/clash-linux-amd64-${{ inputs.clash_core_version }}.gz"
+            CORE_URL="https://release.dreamacro.workers.dev/${{ github.event.inputs.clash_core_version }}/clash-linux-amd64-${{ github.event.inputs.clash_core_version }}.gz"
             ;;
           "armv8")
-            CORE_URL="https://release.dreamacro.workers.dev/${{ inputs.clash_core_version }}/clash-linux-arm64-${{ inputs.clash_core_version }}.gz"
+            CORE_URL="https://release.dreamacro.workers.dev/${{ github.event.inputs.clash_core_version }}/clash-linux-arm64-${{ github.event.inputs.clash_core_version }}.gz"
             ;;
           *)
             echo "::error::不支持的架构: ${{ steps.parse_target.outputs.ARCH }}"
@@ -94,13 +93,13 @@ jobs:
         chmod +x files/etc/openclash/core/clash
 
         # 禁用自动更新
-        sed -i '/option auto_update/{n;s/.*/        option auto_update \"0\"/}' root/etc/config/openclash
-        sed -i '/option release_branch/{n;s/.*/        option release_branch \"disabled\"/}' root/etc/config/openclash
+        sed -i 's/option auto_update .*/option auto_update "0"/' root/etc/config/openclash
+        sed -i 's/option release_branch .*/option release_branch "disabled"/' root/etc/config/openclash
 
     - name: 配置编译环境
       working-directory: openwrt
       run: |
-        echo "CONFIG_TARGET_${{ inputs.target | replace('/','_') }}=y" > .config
+        echo "CONFIG_TARGET_$(echo '${{ github.event.inputs.target }}' | tr / _)=y" > .config
         echo "CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m" >> .config
         echo "CONFIG_PACKAGE_dnsmasq-full=y" >> .config
         echo "CONFIG_PACKAGE_iptables-mod-tproxy=y" >> .config
@@ -113,13 +112,18 @@ jobs:
         export PATH=$PATH:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin
         make -j$(nproc) package/${{ env.PLUGIN_NAME }}/compile V=s
 
+    - name: 获取时间戳
+      id: get_timestamp
+      run: echo "DATE=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
     - name: 打包制品
       run: |
         mkdir -p artifacts
         find openwrt/bin/packages -name "${{ env.PLUGIN_NAME }}*.ipk" -exec cp {} artifacts/ \;
         cd artifacts
         for f in *.ipk; do
-          mv "$f" "openclash_${{ inputs.target | replace('/','-') }}_${{ inputs.firmware_version }}_${{ inputs.clash_core_version }}.ipk"
+          new_name="openclash_$(echo '${{ github.event.inputs.target }}' | tr / -)_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}.ipk"
+          mv "$f" "$new_name"
         done
         echo "生成文件:"
         ls -lh
@@ -135,13 +139,13 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         files: artifacts/*.ipk
-        tag_name: openclash-${{ inputs.target }}-${{ inputs.firmware_version }}-${{ inputs.clash_core_version }}
-        name: OpenClash ${{ inputs.clash_core_version }} (${{ inputs.target }})
+        tag_name: openclash-${{ github.event.inputs.target }}-${{ github.event.inputs.firmware_version }}-${{ github.event.inputs.clash_core_version }}
+        name: OpenClash ${{ github.event.inputs.clash_core_version }} (${{ github.event.inputs.target }})
         body: |
           ### 编译信息
-          - ​**目标架构**: ${{ inputs.target }}
-          - ​**OpenWrt 版本**: ${{ inputs.firmware_version }}
-          - ​**Clash 内核版本**: ${{ inputs.clash_core_version }}
+          - ​**目标架构**: ${{ github.event.inputs.target }}
+          - ​**OpenWrt 版本**: ${{ github.event.inputs.firmware_version }}
+          - ​**Clash 内核版本**: ${{ github.event.inputs.clash_core_version }}
           - ​**编译时间**: ${{ steps.get_timestamp.outputs.DATE }}
           
           ### 预置功能
