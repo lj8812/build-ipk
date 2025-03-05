@@ -22,7 +22,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-20.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
     - name: 检出仓库
@@ -65,33 +65,75 @@ jobs:
         tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
         rm openwrt-sdk.tar.xz
 
+    - name: 准备插件源码
+      working-directory: openwrt/package
+      run: |
+        git clone --depth 1 --branch master https://github.com/vernesong/OpenClash.git ${{ env.PLUGIN_NAME }}
+        
+        cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
+        sed -i -e 's/^    /\t/g' -e 's/\r$//' Makefile
+
+        # 预置 mihomo 内核
+        CORE_DIR="files/etc/openclash/core"
+        mkdir -p $CORE_DIR
+        ARCH=${{ steps.parse_target.outputs.ARCH }}
+
+        CORE_URLS=(
+          "https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-linux-$ARCH-${{ github.event.inputs.clash_core_version }}.gz"
+          "https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-linux-$ARCH.gz"
+        )
+
+        for url in "${CORE_URLS[@]}"; do
+          if curl --output /dev/null --silent --head --fail "$url"; then
+            wget -q "$url" -O clash.gz
+            gunzip clash.gz
+            mv clash $CORE_DIR/
+            chmod 755 $CORE_DIR/clash
+            break
+          fi
+        done
+
     - name: 配置编译环境
       working-directory: openwrt
       run: |
-        # 更新 feeds 确保 luci-base 可用
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a luci
+        # 强制更新所有 feeds
+        ./scripts/feeds update -a -f
+        ./scripts/feeds install -a -f luci
 
+        # 生成编译配置
         cat << EOF > .config
         CONFIG_TARGET_$(echo ${{ github.event.inputs.target }} | tr '/a-z' '_A-Z')=y
         CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m
         CONFIG_PACKAGE_dnsmasq-full=y
         CONFIG_PACKAGE_iptables-mod-tproxy=y
         CONFIG_PACKAGE_luci-compat=y
-        CONFIG_PACKAGE_luci-base=y  # 关键配置
+        CONFIG_PACKAGE_luci-base=y
+        CONFIG_PACKAGE_luci-lib-base=y
+        CONFIG_BUILD_TOOLCHAIN=y
         EOF
-        
-        make defconfig
+
+        # 预编译工具链
+        make tools/install -j$(nproc)
+        make toolchain/install -j$(nproc)
+
+        # 验证工具链
+        echo "当前工具链路径: $PATH"
+        if ! [ -x staging_dir/host/bin/po2lmo ]; then
+          echo "::error::po2lmo 未正确生成"
+          exit 1
+        fi
 
     - name: 执行编译
       working-directory: openwrt
+      env:
+        STAGING_DIR: ${{ github.workspace }}/openwrt/staging_dir
       run: |
-        # 添加 SDK 工具链路径
-        export PATH="$PATH:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin"
+        export PATH="$STAGING_DIR/host/bin:$PATH"
+        echo "最终 PATH 路径: $PATH"
         
-        # 验证 po2lmo 可用性
-        if ! command -v po2lmo &> /dev/null; then
-          echo "::error::po2lmo 未找到，请检查 feeds 配置"
+        # 最终验证
+        if ! command -v po2lmo >/dev/null; then
+          echo "::error::po2lmo 仍然未找到!"
           exit 1
         fi
 
@@ -108,3 +150,11 @@ jobs:
       with:
         name: openclash-packages
         path: openclash_*/*.ipk
+
+    - name: 创建 Release
+      uses: softprops/action-gh-release@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: openclash-${{ steps.parse_target.outputs.TARGET_DASH }}-${{ github.event.inputs.firmware_version }}
+        files: openclash_*/*.ipk
