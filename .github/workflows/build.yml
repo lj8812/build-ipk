@@ -28,17 +28,14 @@ jobs:
     - name: 检出仓库
       uses: actions/checkout@v4
 
-    - name: 安装依赖工具链
+    - name: 安装依赖
       run: |
         sudo apt-get update
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
-          build-essential ccache ecj fastjar file g++ gawk gettext git \
-          libelf-dev libncurses5-dev libncursesw5-dev libssl-dev python3 \
-          python3-distutils python3-setuptools unzip wget rsync subversion \
-          swig time xsltproc zlib1g-dev tree jq lua5.1 lua5.1-dev \
-          ncurses-term  # 新增终端支持
-
-    - name: 设置 Python 环境
+        sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
+        gettext git java-propose-classpath libelf-dev libncurses5-dev \
+        libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
+        unzip wget rsync subversion swig time xsltproc zlib1g-dev tree
+    - name: 设置 Python 软链接
       run: |
         sudo ln -sf /usr/bin/python3 /usr/bin/python
         python --version
@@ -96,12 +93,16 @@ jobs:
 
     - name: 配置编译环境
       working-directory: openwrt
-      env:
-        TERM: xterm-256color  # 设置终端类型
       run: |
-        # 强制更新 feeds 并安装必要组件
-        ./scripts/feeds update -a -f
-        ./scripts/feeds install -a -f luci
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+    - name: 检查工作目录
+      working-directory: openwrt
+      run: |
+        pwd
+        ls -la
+
+
 
         # 生成最小化配置
         cat << EOF > .config
