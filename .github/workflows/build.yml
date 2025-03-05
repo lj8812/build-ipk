@@ -1,20 +1,16 @@
-name: OpenClash 稳定编译 (修复版)
+name: OpenClash AutoBuild (Enhanced)
 
 on:
+  push:
+    branches: [ "main", "dev" ]
+    paths:
+      - 'luci-app-openclash/Makefile'
   workflow_dispatch:
-    inputs:
-      firmware_version:
-        description: 'OpenWrt版本'
-        required: true
-        default: '23.05.5'
-      clash_core:
-        description: 'Mihomo核心版本'
-        required: true
-        default: 'v1.18.0'
 
 env:
   PLUGIN_NAME: luci-app-openclash
-  TARGET: "x86/64"
+  TARGET_ARCH: x86/64
+  SDK_VERSION: 23.05.5
 
 jobs:
   build:
@@ -26,12 +22,10 @@ jobs:
     - name: 🛠️ 初始化工作区
       run: |
         BUILD_DIR="${{ github.workspace }}/openwrt-build"
-        CACHE_DIR="/tmp/sdk_cache"
-        mkdir -p $BUILD_DIR $CACHE_DIR
+        mkdir -p $BUILD_DIR
         echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
-        echo "CACHE_DIR=$CACHE_DIR" >> $GITHUB_ENV
 
-    # ===================== 安装基础依赖 =====================
+    # ===================== 安装依赖 =====================
     - name: 📥 安装编译工具链
       run: |
         sudo apt-get update
@@ -39,50 +33,36 @@ jobs:
           aria2 xz-utils ccache \
           build-essential git python3 \
           libncurses-dev zlib1g-dev \
-          lua5.1 liblua5.1-0-dev lua-filesystem \
-          gcc make
+          lua5.1 liblua5.1-0-dev lua-filesystem
 
-    # ===================== 构建po2lmo工具 =====================
-    - name: 🔧 修复 po2lmo 编译
+    # ===================== 获取版本信息 =====================
+    - name: 🔍 提取版本号
       run: |
-        sudo apt-get install -y gcc make
-        git clone --depth 1 https://github.com/openwrt/luci
-        cd luci
-        
-        # 修正后的编译命令
-        gcc -I modules/luci-base/src \
-          -o po2lmo \
-          modules/luci-base/src/po2lmo.c \
-          modules/luci-base/src/sfh.c
-        
-        # 安装验证
-        sudo install -m 0755 po2lmo /usr/local/bin/
-        echo "po2lmo 校验: $(file /usr/local/bin/po2lmo)"
-        po2lmo --version || echo "版本检测跳过"
+        NEW_VERSION=$(grep 'PKG_VERSION:=' ./${{ env.PLUGIN_NAME }}/Makefile | cut -d= -f2)
+        echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+        echo "当前版本: $NEW_VERSION"
 
-    # ===================== 下载SDK核心 =====================
-    - name: 🌐 多源下载SDK
+    # ===================== 多源下载SDK =====================
+    - name: 🌐 下载OpenWrt SDK
       run: |
-        FW_VER="${{ inputs.firmware_version }}"
-        SAFE_TARGET="x86-64"
-        SDK_FILE="openwrt-sdk-${FW_VER}-${SAFE_TARGET}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+        SAFE_TARGET="${TARGET_ARCH//\//-}"
+        SDK_FILE="openwrt-sdk-${SDK_VERSION}-${SAFE_TARGET}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
         
         MIRRORS=(
-          "https://downloads.openwrt.org/releases/${FW_VER}/targets/x86/64/${SDK_FILE}"
-          "https://mirror.ghproxy.com/https://downloads.openwrt.org/releases/${FW_VER}/targets/x86/64/${SDK_FILE}"
+          "https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${TARGET_ARCH}/${SDK_FILE}"
+          "https://mirror.ghproxy.com/https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${TARGET_ARCH}/${SDK_FILE}"
           "https://op.supes.top/${SDK_FILE}"
         )
 
         for url in "${MIRRORS[@]}"; do
           echo "🔗 尝试下载: $url"
-          if aria2c -x8 -s8 -k1M -d "$CACHE_DIR" -o "$SDK_FILE" "$url"; then
-            if xz -t "$CACHE_DIR/$SDK_FILE"; then
+          if aria2c -x8 -s8 -d "$BUILD_DIR" -o "$SDK_FILE" "$url"; then
+            if xz -t "$BUILD_DIR/$SDK_FILE"; then
               echo "✅ 文件验证通过"
               exit 0
             fi
-            rm -f "$CACHE_DIR/$SDK_FILE"
+            rm -f "$BUILD_DIR/$SDK_FILE"
           fi
-          sleep 10
         done
 
         echo "::error::❌ 所有下载源均不可用"
@@ -91,52 +71,52 @@ jobs:
     # ===================== 准备编译环境 =====================
     - name: 💻 解压SDK
       run: |
-        tar -xJf "$CACHE_DIR/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz" \
+        tar -xJf "$BUILD_DIR/openwrt-sdk-${SDK_VERSION}-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz" \
           -C $BUILD_DIR --strip-components=1
 
-    - name: 📂 准备插件源码
+    # ===================== 构建核心工具 =====================
+    - name: 🔧 编译po2lmo
       run: |
-        cd $BUILD_DIR
-        git clone --depth 1 --branch master \
-          https://github.com/vernesong/OpenClash package/$PLUGIN_NAME
-        
-        # 预处理步骤
-        (cd package/$PLUGIN_NAME && \
-          find . -name Makefile -exec sed -i 's/^    /\t/g' {} + && \
-          po2lmo po/zh-cn/openclash.zh-cn.po openclash.zh-cn.lmo)
+        git clone --depth 1 https://github.com/openwrt/luci $BUILD_DIR/luci
+        gcc -o $BUILD_DIR/staging_dir/host/bin/po2lmo \
+          $BUILD_DIR/luci/modules/luci-base/src/po2lmo.c \
+          $BUILD_DIR/luci/modules/luci-base/src/sfh.c
+        echo "✅ po2lmo 路径: $(which po2lmo)"
 
-    # ===================== 编译配置 =====================
-    - name: ⚙️ 生成配置
+    # ===================== 编译插件 =====================
+    - name: 🏭 编译OpenClash
       run: |
         cd $BUILD_DIR
+        cp -rf ../${{ env.PLUGIN_NAME }} package/
+        
+        # 修复Makefile格式
+        find package/${{ env.PLUGIN_NAME }} -name Makefile -exec sed -i 's/^    /\t/g' {} +
+        
+        # 生成配置
         cat > .config <<EOF
         CONFIG_TARGET_x86_64=y
-        CONFIG_PACKAGE_${PLUGIN_NAME}=m
+        CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m
         CONFIG_PACKAGE_luci-compat=y
         EOF
+        
+        # 执行编译
         make defconfig
-
-    # ===================== 执行编译 =====================
-    - name: 🏭 核心编译流程
-      run: |
-        cd $BUILD_DIR
-        PATH="/usr/local/bin:$PATH" make -j$(($(nproc) + 2)) \
-          V=sc \
+        make -j$(($(nproc) + 2)) V=sc \
           CONFIG_DEBUG_SECTION_MISMATCH=y \
-          package/$PLUGIN_NAME/compile
+          package/${{ env.PLUGIN_NAME }}/compile
 
     # ===================== 发布管理 =====================
-    - name: 🚀 发布制品
+    - name: 🚀 发布版本
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          $BUILD_DIR/bin/packages/**/*.ipk
-        tag_name: openclash-${{ inputs.clash_core }}-$(date +%Y%m%d)
+          ${{ env.BUILD_DIR }}/bin/packages/**/*.ipk
+        tag_name: v${{ env.NEW_VERSION }}
+        name: OpenClash ${{ env.NEW_VERSION }}
         body: |
-          ### 编译信息
-          - ​**架构**: x86/64
-          - ​**OpenWrt版本**: ${{ inputs.firmware_version }}
-          - ​**核心版本**: ${{ inputs.clash_core }}
+          ### 构建信息
+          - ​**架构**: ${{ env.TARGET_ARCH }}
+          - ​**SDK版本**: ${{ env.SDK_VERSION }}
           - ​**编译时间**: `$(date -u +"%Y-%m-%dT%H:%M:%SZ")`
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
