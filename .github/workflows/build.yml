@@ -39,24 +39,16 @@ jobs:
           aria2 xz-utils ccache \
           build-essential git python3 \
           libncurses-dev zlib1g-dev \
-          lua5.1 liblua5.1-0-dev
+          lua5.1 liblua5.1-0-dev lua-filesystem
 
-    # ===================== 修复 LuCI 工具链 =====================
-    - name: 🔧 安装 LuCI 依赖
+    # ===================== 准备LuCI工具链 =====================
+    - name: 🔧 构建po2lmo工具
       run: |
-        # 安装运行时依赖
-        sudo apt-get install -y \
-          luci-base \
-          luci-i18n-base-en \
-          lua-filesystem
-
-        # 手动编译 po2lmo
-        git clone --depth 1 https://github.com/openwrt/luci.git
+        git clone --depth 1 https://github.com/openwrt/luci
         cd luci
         make tools/install -j$(nproc)
-        sudo cp staging_dir/host/bin/po2lmo /usr/local/bin/
-        sudo chmod +x /usr/local/bin/po2lmo
-        echo "✅ po2lmo 安装完成：$(which po2lmo)"
+        sudo install -m 0755 staging_dir/host/bin/po2lmo /usr/local/bin/
+        echo "po2lmo路径: $(which po2lmo)"
 
     # ===================== 下载SDK核心 =====================
     - name: 🌐 多源下载SDK
@@ -73,14 +65,15 @@ jobs:
 
         for url in "${MIRRORS[@]}"; do
           echo "🔗 尝试下载: $url"
-          if aria2c -x8 --file-allocation=none -d "$CACHE_DIR" -o "$SDK_FILE" "$url"; then
+          if aria2c -x8 -s8 -k1M -d "$CACHE_DIR" -o "$SDK_FILE" "$url"; then
             if xz -t "$CACHE_DIR/$SDK_FILE"; then
-              echo "✅ 下载验证成功"
+              echo "✅ 文件验证通过"
               exit 0
             fi
             rm -f "$CACHE_DIR/$SDK_FILE"
           fi
         done
+
         echo "::error::❌ 所有下载源均不可用"
         exit 1
 
@@ -96,13 +89,13 @@ jobs:
         git clone --depth 1 --branch master \
           https://github.com/vernesong/OpenClash package/$PLUGIN_NAME
         
-        # 修复Makefile格式
-        find package/$PLUGIN_NAME -name Makefile -exec sed -i 's/^    /\t/g' {} +
-        # 预转换语言文件
-        (cd package/$PLUGIN_NAME && po2lmo po/zh-cn/openclash.zh-cn.po openclash.zh-cn.lmo)
+        # 预处理步骤
+        (cd package/$PLUGIN_NAME && \
+          find . -name Makefile -exec sed -i 's/^    /\t/g' {} + && \
+          po2lmo po/zh-cn/openclash.zh-cn.po openclash.zh-cn.lmo)
 
     # ===================== 编译配置 =====================
-    - name: ⚙️ 生成配置
+    - name: ⚙️ 生成编译配置
       run: |
         cd $BUILD_DIR
         cat > .config <<EOF
@@ -116,7 +109,7 @@ jobs:
     - name: 🏭 核心编译流程
       run: |
         cd $BUILD_DIR
-        make -j$(($(nproc) + 2)) \
+        PATH="/usr/local/bin:$PATH" make -j$(($(nproc) + 2)) \
           V=sc \
           CONFIG_DEBUG_SECTION_MISMATCH=y \
           package/$PLUGIN_NAME/compile
@@ -147,5 +140,5 @@ jobs:
             issue_number: context.issue.number,
             owner: context.repo.owner,
             repo: context.repo.repo,
-            body: `⚠️ 编译失败！错误详情：\n${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            body: `⚠️ 编译失败！错误日志：\n${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
           })
