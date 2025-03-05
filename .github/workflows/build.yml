@@ -1,32 +1,32 @@
-name: 编译 OpenClash 插件
+name: 编译 OpenClash 插件（含内核）
 
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: '目标架构 (x86/64 或 armvirt/64)'
+        description: '目标平台/架构 (如x86/64)'
         required: true
         default: 'x86/64'
       firmware_version:
-        description: 'OpenWrt 版本 (如 23.05.5)'
+        description: 'OpenWrt固件版本'
         required: true
         default: '23.05.5'
       clash_core_version:
-        description: 'mihomo 内核版本 (带 v 前缀)'
+        description: 'Mihomo内核版本'
         required: true
-        default: 'v1.18.0'
-
-env:
-  PLUGIN_NAME: luci-app-openclash
+        default: 'v1.3.5'
+      plugin_branch:
+        description: '插件源码分支'
+        required: true
+        default: 'master'
 
 jobs:
   build:
     runs-on: ubuntu-20.04
-    timeout-minutes: 120
 
     steps:
-    - name: 检出仓库
-      uses: actions/checkout@v4
+    - name: 检出代码
+      uses: actions/checkout@v2
 
     - name: 安装依赖
       run: |
@@ -35,125 +35,105 @@ jobs:
         gettext git java-propose-classpath libelf-dev libncurses5-dev \
         libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
         unzip wget rsync subversion swig time xsltproc zlib1g-dev tree
+
     - name: 设置 Python 软链接
       run: |
         sudo ln -sf /usr/bin/python3 /usr/bin/python
-        python --version
 
-    - name: 解析目标参数
-      id: parse_target
+    - name: 设置目标变量
+      id: set_target
       run: |
-        TARGET_DASH=$(echo "${{ github.event.inputs.target }}" | sed 's/\//-/g')
-        echo "TARGET_DASH=$TARGET_DASH" >> $GITHUB_OUTPUT
+        TARGET_DASH=$(echo ${{ github.event.inputs.target }} | sed 's/\//-/')
+        echo "TARGET_DASH=$TARGET_DASH" >> $GITHUB_ENV
         
+        # 转换架构为mihomo内核命名格式
         case "${{ github.event.inputs.target }}" in
-          "x86/64")    ARCH="amd64"  ;;
-          "armvirt/64") ARCH="arm64" ;;
-          *) echo "::error::不支持的架构"; exit 1 ;;
+          "x86/64")   ARCH="amd64" ;;
+          "armvirt/64") ARCH="armv8" ;;
+          "arm64")    ARCH="armv8" ;;
+          "arm/armv7") ARCH="armv7" ;;
+          *)          ARCH="amd64" ;;
         esac
-        echo "ARCH=$ARCH" >> $GITHUB_OUTPUT
+        echo "ARCH=$ARCH" >> $GITHUB_ENV
 
-    - name: 下载 OpenWrt SDK
+    - name: 下载并解压 OpenWrt 源码
       run: |
         SDK_BASE_URL="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
-        SDK_FILE=$(curl -s "$SDK_BASE_URL" | grep -oP "openwrt-sdk-.*?-${{ steps.parse_target.outputs.TARGET_DASH }}_gcc-.*?Linux-x86_64.tar.xz" | head -n1)
-
-        mkdir -p openwrt
-        wget --tries=3 "${SDK_BASE_URL}${SDK_FILE}" -O openwrt-sdk.tar.xz
-        tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
-        rm openwrt-sdk.tar.xz
+        SDK_FILE=$(curl -s $SDK_BASE_URL | grep -oP 'openwrt-sdk-.*?-${{ env.TARGET_DASH }}_gcc-.*?Linux-x86_64.tar.xz' | head -n 1)
+        SDK_URL="${SDK_BASE_URL}${SDK_FILE}"
+        wget $SDK_URL -O openwrt.tar.xz
+        mkdir openwrt
+        tar -xJf openwrt.tar.xz -C openwrt --strip-components 1
 
     - name: 准备插件源码
       working-directory: openwrt/package
       run: |
-        git clone --depth 1 --branch master https://github.com/vernesong/OpenClash.git ${{ env.PLUGIN_NAME }}
-        
-        cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
-        sed -i -e 's/^    /\t/g' -e 's/\r$//' Makefile
+        git clone --depth 1 --branch ${{ github.event.inputs.plugin_branch }} \
+          https://github.com/vernesong/OpenClash.git luci-app-openclash
 
-        # 预置 mihomo 内核
-        CORE_DIR="files/etc/openclash/core"
-        mkdir -p $CORE_DIR
-        ARCH=${{ steps.parse_target.outputs.ARCH }}
+        # 修复Makefile格式
+        cd luci-app-openclash/luci-app-openclash
+        sed -i 's/^    /\t/g' Makefile
+        sed -i 's/\r$//' Makefile
 
-        CORE_URLS=(
-          "https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-linux-$ARCH-${{ github.event.inputs.clash_core_version }}.gz"
-          "https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-linux-$ARCH.gz"
-        )
+        # 创建核心目录
+        mkdir -p files/etc/openclash/core
 
-        for url in "${CORE_URLS[@]}"; do
-          if curl --output /dev/null --silent --head --fail "$url"; then
-            wget -q "$url" -O clash.gz
-            gunzip clash.gz
-            mv clash $CORE_DIR/
-            chmod 755 $CORE_DIR/clash
-            break
-          fi
-        done
+        # 下载mihomo内核
+        CORE_URL="https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-linux-${{ env.ARCH }}.gz"
+        wget -q $CORE_URL -O clash.gz
+        gunzip clash.gz
+        mv clash files/etc/openclash/core/
+        chmod 755 files/etc/openclash/core/clash
 
-    - name: 配置编译环境
+        # 获取插件版本
+        PLUGIN_VERSION=$(grep 'PKG_VERSION:=' Makefile | cut -d '=' -f2)
+        echo "PLUGIN_NAME=luci-app-openclash" >> $GITHUB_ENV
+        echo "PLUGIN_VERSION=$PLUGIN_VERSION" >> $GITHUB_ENV
+
+    - name: 更新 feeds
       working-directory: openwrt
       run: |
         ./scripts/feeds update -a
         ./scripts/feeds install -a
-    - name: 检查工作目录
+        ./scripts/feeds install luci-compat
+
+    - name: 配置编译参数
       working-directory: openwrt
       run: |
-        pwd
-        ls -la
+        echo "CONFIG_TARGET_${{ github.event.inputs.target }}_DEVICE_generic=y" > .config
+        echo "CONFIG_PACKAGE_luci-app-openclash=m" >> .config
+        make defconfig
 
-
-
-        # 生成最小化配置
-        cat << EOF > .config
-        CONFIG_TARGET_$(echo ${{ github.event.inputs.target }} | tr '/a-z' '_A-Z')=y
-        CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m
-        CONFIG_PACKAGE_dnsmasq-full=y
-        CONFIG_PACKAGE_iptables-mod-tproxy=y
-        CONFIG_PACKAGE_luci-compat=y
-        CONFIG_PACKAGE_luci-base=y
-        CONFIG_PACKAGE_luci-lib-base=y
-        CONFIG_TERM="xterm-256color"  # 终端类型配置
-        EOF
-
-        # 生成确定性配置
-        make defconfig CONFIG_DEFAULT_DESIGNATED=y
-
-        # 预编译工具链 (非交互式)
-        make -j$(nproc) tools/install
-        make -j$(nproc) toolchain/install
-
-    - name: 执行编译
+    - name: 编译插件
       working-directory: openwrt
-      env:
-        TERM: dumb  # 禁用终端交互
-        STAGING_DIR: ${{ github.workspace }}/openwrt/staging_dir
       run: |
-        export PATH="$STAGING_DIR/host/bin:$PATH"
-        
-        # 非交互式编译
-        make -j$(($(nproc) + 1)) package/${{ env.PLUGIN_NAME }}/compile \
-          V=s \
-          FORCE_UNSAFE_CONFIGURE=1 \
-          DEBIAN_FRONTEND=noninteractive \
-          TERM=dumb
+        make package/luci-app-openclash/compile V=s -j$(nproc)
 
-    - name: 打包输出
+    - name: 整理输出文件
       run: |
-        ARTIFACT_DIR="openclash_${{ steps.parse_target.outputs.TARGET_DASH }}_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}"
-        mkdir -p $ARTIFACT_DIR
-        find openwrt/bin/packages -name "luci-app-openclash*.ipk" -exec cp -v {} $ARTIFACT_DIR/ \;
+        mkdir -p firmware
+        find openwrt/bin/packages -name "luci-app-openclash*.ipk" -exec cp {} firmware \;
+        find openwrt/bin/targets -name "mihomo*.ipk" -exec cp {} firmware \; || true
 
-    - name: 上传制品
-      uses: actions/upload-artifact@v4
-      with:
-        name: openclash-packages
-        path: openclash_*/*.ipk
+        cd firmware
+        for file in *.ipk; do
+          new_name="${{ env.TARGET_DASH }}-${{ github.event.inputs.firmware_version }}-${file%.*}-${{ github.event.inputs.clash_core_version }}.ipk"
+          mv "$file" "$new_name"
+        done
 
     - name: 创建 Release
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v1
+      with:
+        files: firmware/*
+        name: OpenClash-${{ env.TARGET_DASH }}-${{ github.event.inputs.firmware_version }}
+        tag_name: openclash-${{ github.event.inputs.firmware_version }}-${{ github.event.inputs.clash_core_version }}
+        body: |
+          编译信息：
+          - 目标架构：${{ github.event.inputs.target }} (${{ env.ARCH }})
+          - OpenWrt版本：${{ github.event.inputs.firmware_version }}
+          - Mihomo内核版本：${{ github.event.inputs.clash_core_version }}
+          - 插件版本：${{ env.PLUGIN_VERSION }}
+          - 源码分支：${{ github.event.inputs.plugin_branch }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: openclash-${{ steps.parse_target.outputs.TARGET_DASH }}-${{ github.event.inputs.firmware_version }}
-        files: openclash_*/*.ipk
