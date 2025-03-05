@@ -37,17 +37,19 @@ jobs:
           python3-distutils python3-setuptools unzip wget rsync subversion \
           swig time xsltproc zlib1g-dev tree jq lua5.1 lua5.1-dev
 
-        # 安装 LuCI 工具链
-        git clone --depth=1 https://github.com/openwrt/luci.git /tmp/luci
+        # 安装 po2lmo
+        git clone --depth=1 https://github.com/openwrt/luci /tmp/luci
         cd /tmp/luci
-        make tools/install -j$(nproc)
-        sudo cp -f staging_dir/host/bin/po2lmo /usr/local/bin/
+        make -j$(nproc) -C tools
+        sudo install -m 0755 tools/po2lmo/po2lmo /usr/local/bin/
         cd && rm -rf /tmp/luci
+
+        # 验证安装
+        po2lmo --version || { echo "po2lmo 安装失败"; exit 1; }
 
     - name: 设置 Python 环境
       run: |
-        sudo rm -f /usr/bin/python
-        sudo ln -s /usr/bin/python3 /usr/bin/python
+        sudo ln -sf /usr/bin/python3 /usr/bin/python
         python --version
 
     - name: 解析目标参数
@@ -104,19 +106,14 @@ jobs:
     - name: 配置编译环境
       working-directory: openwrt
       run: |
-        # 更新 feeds 并安装 LuCI 依赖
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a luci
-
         cat << EOF > .config
         CONFIG_TARGET_$(echo ${{ github.event.inputs.target }} | tr '/a-z' '_A-Z')=y
         CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m
-        CONFIG_PACKAGE_luci-lib-base=y
-        CONFIG_PACKAGE_luci-lib-ipkg=y
-        CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
         CONFIG_PACKAGE_dnsmasq-full=y
         CONFIG_PACKAGE_iptables-mod-tproxy=y
         CONFIG_PACKAGE_luci-compat=y
+        CONFIG_PACKAGE_luci-lib-base=y
+        CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
         EOF
         
         make defconfig
@@ -124,9 +121,7 @@ jobs:
     - name: 执行编译
       working-directory: openwrt
       run: |
-        export PATH="$PATH:/usr/local/bin:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin"
-        echo "当前 PATH: $PATH"
-        po2lmo --version || { echo "po2lmo 未找到！"; exit 1; }
+        export PATH="$PATH:/usr/local/bin"
         make -j$(($(nproc) + 1)) package/${{ env.PLUGIN_NAME }}/compile V=s
 
     - name: 打包输出
@@ -140,11 +135,3 @@ jobs:
       with:
         name: openclash-packages
         path: openclash_*/*.ipk
-
-    - name: 创建 Release
-      uses: softprops/action-gh-release@v2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: openclash-${{ steps.parse_target.outputs.TARGET_DASH }}-${{ github.event.inputs.firmware_version }}
-        files: openclash_*/*.ipk
