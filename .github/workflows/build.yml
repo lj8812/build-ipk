@@ -22,7 +22,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-20.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
     - name: 检出仓库
@@ -35,7 +35,14 @@ jobs:
           build-essential ccache ecj fastjar file g++ gawk gettext git \
           libelf-dev libncurses5-dev libncursesw5-dev libssl-dev python3 \
           python3-distutils python3-setuptools unzip wget rsync subversion \
-          swig time xsltproc zlib1g-dev tree jq
+          swig time xsltproc zlib1g-dev tree jq lua5.1 lua5.1-dev
+
+        # 安装 LuCI 工具链
+        git clone --depth=1 https://github.com/openwrt/luci.git /tmp/luci
+        cd /tmp/luci
+        make tools/install -j$(nproc)
+        sudo cp -f staging_dir/host/bin/po2lmo /usr/local/bin/
+        cd && rm -rf /tmp/luci
 
     - name: 设置 Python 环境
       run: |
@@ -59,49 +66,12 @@ jobs:
     - name: 下载 OpenWrt SDK
       run: |
         SDK_BASE_URL="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
-        echo "🛠️ SDK 基地址: $SDK_BASE_URL"
-
-        # 获取 SDK 文件名
         SDK_FILE=$(curl -s "$SDK_BASE_URL" | grep -oP "openwrt-sdk-.*?-${{ steps.parse_target.outputs.TARGET_DASH }}_gcc-.*?Linux-x86_64.tar.xz" | head -n1)
-        if [ -z "$SDK_FILE" ]; then
-          echo "::error::❌ SDK 文件未找到，请检查："
-          echo "1. 版本是否存在: ${{ github.event.inputs.firmware_version }}"
-          echo "2. 架构是否正确: ${{ github.event.inputs.target }}"
-          exit 1
-        fi
 
-        # 创建目标目录
         mkdir -p openwrt
-
-        # 下载并解压
-        echo "🔗 下载地址: ${SDK_BASE_URL}${SDK_FILE}"
-        wget \
-          --tries=3 \
-          --progress=bar:force:noscroll \
-          --continue \
-          "${SDK_BASE_URL}${SDK_FILE}" \
-          -O openwrt-sdk.tar.xz
-
-        # 解压前校验
-        if ! tar -tvJf openwrt-sdk.tar.xz > /dev/null; then
-          echo "::error::❌ 压缩包校验失败"
-          exit 2
-        fi
-
-        # 执行解压（明确指定输出目录）
-        tar -xJf openwrt-sdk.tar.xz \
-          --strip-components=1 \
-          -C openwrt
-
-        # 验证解压结果
-        if [ ! -f "openwrt/include/kernel-version.mk" ]; then
-          echo "::error::❌ 关键文件缺失，解压失败"
-          exit 3
-        fi
-
-        # 清理临时文件
-        rm -f openwrt-sdk.tar.xz
-        echo "✅ SDK 准备就绪，目录大小: $(du -sh openwrt | cut -f1)"
+        wget --tries=3 "${SDK_BASE_URL}${SDK_FILE}" -O openwrt-sdk.tar.xz
+        tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
+        rm openwrt-sdk.tar.xz
 
     - name: 准备插件源码
       working-directory: openwrt/package
@@ -109,15 +79,7 @@ jobs:
         git clone --depth 1 --branch master https://github.com/vernesong/OpenClash.git ${{ env.PLUGIN_NAME }}
         
         cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
-
-        # 修复 Makefile 格式
         sed -i -e 's/^    /\t/g' -e 's/\r$//' Makefile
-
-        # 严格缩进验证
-        if grep -q '^    ' Makefile; then
-          echo "::error::❌ 检测到未转换的空格缩进"
-          exit 1
-        fi
 
         # 预置 mihomo 内核
         CORE_DIR="files/etc/openclash/core"
@@ -130,33 +92,28 @@ jobs:
         )
 
         for url in "${CORE_URLS[@]}"; do
-          echo "🔍 尝试下载: $url"
           if curl --output /dev/null --silent --head --fail "$url"; then
-            echo "✅ 有效链接: $url"
-            wget -q --show-progress "$url" -O clash.gz
-            if gunzip -t clash.gz; then
-              gunzip clash.gz
-              mv clash $CORE_DIR/
-              chmod 755 $CORE_DIR/clash
-              echo "🎉 内核部署成功"
-              break
-            else
-              echo "⚠️ 压缩包损坏，尝试下一个链接..."
-              rm -f clash.gz
-            fi
+            wget -q "$url" -O clash.gz
+            gunzip clash.gz
+            mv clash $CORE_DIR/
+            chmod 755 $CORE_DIR/clash
+            break
           fi
         done
-
-        # 禁用自动更新
-        sed -i -e 's/option auto_update .*/option auto_update "0"/' \
-               -e 's/option release_branch .*/option release_branch "disabled"/' root/etc/config/openclash
 
     - name: 配置编译环境
       working-directory: openwrt
       run: |
+        # 更新 feeds 并安装 LuCI 依赖
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a luci
+
         cat << EOF > .config
         CONFIG_TARGET_$(echo ${{ github.event.inputs.target }} | tr '/a-z' '_A-Z')=y
         CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m
+        CONFIG_PACKAGE_luci-lib-base=y
+        CONFIG_PACKAGE_luci-lib-ipkg=y
+        CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
         CONFIG_PACKAGE_dnsmasq-full=y
         CONFIG_PACKAGE_iptables-mod-tproxy=y
         CONFIG_PACKAGE_luci-compat=y
@@ -167,7 +124,9 @@ jobs:
     - name: 执行编译
       working-directory: openwrt
       run: |
-        export PATH="$PATH:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin"
+        export PATH="$PATH:/usr/local/bin:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin"
+        echo "当前 PATH: $PATH"
+        po2lmo --version || { echo "po2lmo 未找到！"; exit 1; }
         make -j$(($(nproc) + 1)) package/${{ env.PLUGIN_NAME }}/compile V=s
 
     - name: 打包输出
@@ -188,17 +147,4 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: openclash-${{ steps.parse_target.outputs.TARGET_DASH }}-${{ github.event.inputs.firmware_version }}
-        name: OpenClash ${{ github.event.inputs.clash_core_version }} (${{ github.event.inputs.target }})
-        body: |
-          ### 编译信息
-          - ​**目标架构**: `${{ github.event.inputs.target }}`
-          - ​**OpenWrt 版本**: ${{ github.event.inputs.firmware_version }}
-          - ​**mihomo 版本**: ${{ github.event.inputs.clash_core_version }}
-          - ​**编译时间**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          ### 安装说明
-          ```bash
-          opkg install luci-app-openclash_*.ipk
-          /etc/init.d/openclash start
-          ```
         files: openclash_*/*.ipk
