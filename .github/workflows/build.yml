@@ -1,4 +1,4 @@
-name: OpenClash 稳定编译
+name: OpenClash 稳定编译 (修复版)
 
 on:
   workflow_dispatch:
@@ -22,8 +22,8 @@ jobs:
     timeout-minutes: 60
 
     steps:
-    # ===================== 初始化阶段 =====================
-    - name: 🛠️ 初始化环境
+    # ===================== 初始化环境 =====================
+    - name: 🛠️ 初始化工作区
       run: |
         BUILD_DIR="${{ github.workspace }}/openwrt-build"
         CACHE_DIR="/tmp/sdk_cache"
@@ -39,16 +39,23 @@ jobs:
           aria2 xz-utils ccache \
           build-essential git python3 \
           libncurses-dev zlib1g-dev \
-          lua5.1 liblua5.1-0-dev lua-filesystem
+          lua5.1 liblua5.1-0-dev lua-filesystem \
+          gcc make
 
-    # ===================== 准备LuCI工具链 =====================
-    - name: 🔧 构建po2lmo工具
+    # ===================== 构建po2lmo工具 =====================
+    - name: 🔧 编译po2lmo转换器
       run: |
+        # 克隆LuCI源码
         git clone --depth 1 https://github.com/openwrt/luci
         cd luci
-        make tools/install -j$(nproc)
-        sudo install -m 0755 staging_dir/host/bin/po2lmo /usr/local/bin/
-        echo "po2lmo路径: $(which po2lmo)"
+        
+        # 直接编译po2lmo
+        mkdir -p build
+        gcc -o build/po2lmo modules/luci-base/src/po2lmo.c
+        
+        # 安装到系统路径
+        sudo install -m 0755 build/po2lmo /usr/local/bin/
+        echo "✅ po2lmo版本: $(po2lmo --version || echo '未获取版本')"
 
     # ===================== 下载SDK核心 =====================
     - name: 🌐 多源下载SDK
@@ -72,6 +79,7 @@ jobs:
             fi
             rm -f "$CACHE_DIR/$SDK_FILE"
           fi
+          sleep 10
         done
 
         echo "::error::❌ 所有下载源均不可用"
@@ -95,7 +103,7 @@ jobs:
           po2lmo po/zh-cn/openclash.zh-cn.po openclash.zh-cn.lmo)
 
     # ===================== 编译配置 =====================
-    - name: ⚙️ 生成编译配置
+    - name: ⚙️ 生成配置
       run: |
         cd $BUILD_DIR
         cat > .config <<EOF
