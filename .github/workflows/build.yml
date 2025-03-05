@@ -1,81 +1,6 @@
 name: OpenClash Stable Builder
 
 on:
-  push:
-    paths:
-      - '**.yml'
-      - '**.yaml'
-    branches: [ "main", "master" ]
-
-  workflow_dispatch:
-    inputs:
-      target:
-        description: 'Target Architecture (e.g. x86/64)'
-        required: true
-        default: 'x86/64'
-      firmware_version:
-        description: 'OpenWrt Version'
-        required: true
-        default: '23.05.5'
-      clash_core:
-        description: 'Mihomo Core Version (with v prefix)'
-        required: true
-        default: 'v1.18.0'
-
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 50
-    env:
-      PLUGIN_NAME: luci-app-openclash
-
-    steps:
-    # ===================== 初始化阶段 =====================
-    - name: 🏗️ Initialize Workspace
-      run: |
-        # 定义路径变量（正确使用上下文）
-        BUILD_DIR="${{ github.workspace }}/openwrt-build"
-        CACHE_DIR="${{ runner.temp }}/sdk_cache"
-        mkdir -p $BUILD_DIR $CACHE_DIR
-        echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
-        echo "CACHE_DIR=$CACHE_DIR" >> $GITHUB_ENV
-
-    # ===================== 依赖安装 =====================
-    - name: 📦 Install Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          aria2 xz-utils ccache \
-          build-essential git python3 \
-          libncurses-dev zlib1g-dev
-
-    # ===================== 架构解析 =====================
-    - name: 🔍 Parse Target Architecture
-      run: |
-        case "${{ inputs.target }}" in
-          "x86/64")
-            TARGET_CFG="x86_64"
-            ARCH="amd64"
-            ;;
-          "arm/armv7")
-            TARGET_CFG="armv7"
-            ARCH="armv7"
-            ;;
-          "armvirt/64")
-            TARGET_CFG="armvirt"
-            ARCH="armv8"
-            ;;
-          *)
-            TARGET_CFG="generic"
-            ARCH="amd64"
-            ;;
-        esac
-        echo "TARGET_CFG=$TARGET_CFG" >> $GITHUB_ENV
-        echo "ARCH=$ARCH" >> $GITHUB_ENV
-
-name: OpenClash Stable Builder
-
-on:
   workflow_dispatch:
     inputs:
       target:
@@ -144,6 +69,9 @@ jobs:
 
         echo "::error::所有下载源均失败"
         exit 1
+
+    # ===================== 后续步骤 =====================
+    # ... [保留原有的编译和发布步骤] ...
 
     # ===================== 后续步骤 =====================
     # ... [保留原有的编译和发布步骤] ...
