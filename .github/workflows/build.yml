@@ -1,81 +1,44 @@
-name: 编译 OpenClash 插件（含内核）
+name: 编译 OpenWrt 插件
 
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: '目标平台/架构 (如x86/64)'
+        description: '目标平台/架构'
         required: true
         default: 'x86/64'
       firmware_version:
-        description: 'OpenWrt固件版本'
+        description: '固件版本'
         required: true
         default: '23.05.5'
-      clash_core_version:
-        description: 'Mihomo内核版本 (带v前缀)'
+      plugin_source:
+        description: '插件源码地址'
         required: true
-        default: 'v1.18.0'
-      plugin_branch:
-        description: '插件源码分支'
-        required: true
-        default: 'master'
+        default: 'https://github.com/lj8812/luci-app-macfilter.git'
 
 jobs:
   build:
     runs-on: ubuntu-20.04
-    timeout-minutes: 45
 
     steps:
     - name: 检出代码
-      uses: actions/checkout@v4
-
+      uses: actions/checkout@v2
+      
     - name: 安装依赖
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
-          build-essential ccache ecj fastjar file g++ gawk gettext git \
-          libelf-dev libncurses5-dev libncursesw5-dev libssl-dev \
-          python3 python3-distutils python3-setuptools unzip wget \
-          rsync subversion swig time xsltproc zlib1g-dev tree jq
-
-    - name: 设置 Python 环境
+        sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
+        gettext git java-propose-classpath libelf-dev libncurses5-dev \
+        libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
+        unzip wget rsync subversion swig time xsltproc zlib1g-dev tree
+    - name: 设置 Python 软链接
       run: |
         sudo ln -sf /usr/bin/python3 /usr/bin/python
-        python -m pip install --upgrade pip
-        pip install requests
-
     - name: 设置目标变量
       id: set_target
       run: |
-        # 转换架构命名
-        case "${{ github.event.inputs.target }}" in
-          "x86/64")       ARCH="amd64"; TARGET_NAME="x86_64" ;;
-          "armvirt/64")   ARCH="armv8"; TARGET_NAME="armvirt" ;;
-          "arm64")        ARCH="armv8"; TARGET_NAME="arm64" ;;
-          "arm/armv7")    ARCH="armv7"; TARGET_NAME="armv7" ;;
-          "mips/mips32")  ARCH="mips"; TARGET_NAME="mips32" ;;
-          "mips/mips64")  ARCH="mips64"; TARGET_NAME="mips64" ;;
-          "riscv/64")     ARCH="riscv64"; TARGET_NAME="riscv64" ;;
-          *)              ARCH="amd64"; TARGET_NAME="generic" ;;
-        esac
-
-        TARGET_DASH=$(echo "${{ github.event.inputs.target }}" | sed 's/\//-/g')
-        echo "ARCH=$ARCH" >> $GITHUB_ENV
-        echo "TARGET_DASH=$TARGET_DASH" >> $GITHUB_ENV
-        echo "TARGET_NAME=$TARGET_NAME" >> $GITHUB_ENV
-
-    - name: 验证内核版本
-      run: |
-        VERSION_URL="https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${{ github.event.inputs.clash_core_version }}"
-        RESPONSE=$(curl -s -H "Accept: application/vnd.github.v3+json" -w "%{http_code}" -o /dev/null $VERSION_URL)
-        
-        if [ "$RESPONSE" -ne 200 ]; then
-          echo "::error::无效的 Mihomo 版本: ${{ github.event.inputs.clash_core_version }}"
-          echo "可用版本查看: https://github.com/MetaCubeX/mihomo/releases"
-          exit 1
-        fi
-
-- name: 下载并解压 OpenWrt 源码
+        echo "TARGET_DASH=$(echo ${{ github.event.inputs.target }} | sed 's/\//-/')" >> $GITHUB_OUTPUT
+    - name: 下载并解压 OpenWrt 源码
       run: |
         SDK_BASE_URL="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
         SDK_FILE=$(curl -s $SDK_BASE_URL | grep -oP 'openwrt-sdk-.*?-${{ steps.set_target.outputs.TARGET_DASH }}_gcc-.*?Linux-x86_64.tar.xz' | head -n 1)
@@ -94,93 +57,70 @@ jobs:
           echo "SDK 下载失败"
           exit 1
         fi
-
-    - name: 准备插件源码
-      env:
-        PLUGIN_NAME: luci-app-openclash
+    - name: 克隆插件源码
+      working-directory: openwrt/package
       run: |
-        cd $SDK_PATH
-        git clone --depth 1 --branch ${{ github.event.inputs.plugin_branch }} \
-          https://github.com/vernesong/OpenClash.git package/$PLUGIN_NAME
-
-        # 修复源码格式
-        cd package/$PLUGIN_NAME/$PLUGIN_NAME
-        sed -i -e 's/^    /\t/g' -e 's/\r$//' Makefile
-
-        # 获取插件版本
-        PLUGIN_VERSION=$(make -s -f version.mk 2>/dev/null | grep 'PKG_VERSION' | cut -d '=' -f2)
-        echo "PLUGIN_VERSION=${PLUGIN_VERSION:-dev}" >> $GITHUB_ENV
-
-    - name: 预置内核文件
-      run: |
-        CORE_DIR="$SDK_PATH/package/$PLUGIN_NAME/$PLUGIN_NAME/files/etc/openclash/core"
-        mkdir -p $CORE_DIR
+        git clone ${{ github.event.inputs.plugin_source }} plugin
         
-        # 下载最新mihomo内核
-        CORE_URL="https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-linux-${{ env.ARCH }}.gz"
-        wget -q $CORE_URL -O $CORE_DIR/clash.gz
-        gunzip $CORE_DIR/clash.gz
-        chmod 755 $CORE_DIR/clash
-
-        # 验证内核文件
-        if [ ! -f $CORE_DIR/clash ]; then
-          echo "::error::内核下载失败，请检查架构匹配"
-          exit 1
-        fi
-
-    - name: 配置编译环境
+        # ========== 新增修复步骤 ==========
+        cd plugin
+        sed -i 's/^    /\t/' Makefile  # 修复Makefile缩进
+          
+        # 验证Tab缩进（显示^I表示成功）
+        echo "::group::Makefile缩进检查"
+        cat -e -t -v Makefile | grep -m 3 '^\^I'
+        [ $? -eq 0 ] && echo "✅ Tab缩进验证通过" || { echo "❌ Tab缩进异常"; exit 1; }
+        echo "::endgroup::"
+        cd ..
+        # ================================
+        cd plugin
+        
+        chmod +x $GITHUB_WORKSPACE/.github/scripts/get_plugin_info.sh
+        $GITHUB_WORKSPACE/.github/scripts/get_plugin_info.sh
+    - name: 更新 feeds
+      working-directory: openwrt
       run: |
-        cd $SDK_PATH
-        echo "CONFIG_TARGET_${{ env.TARGET_NAME }}=y" > .config
-        echo "CONFIG_PACKAGE_$PLUGIN_NAME=m" >> .config
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+    - name: 检查工作目录
+      working-directory: openwrt
+      run: |
+        pwd
+        ls -la
+    - name: 配置 OpenWrt
+      working-directory: openwrt
+      run: |
+        # TARGET=$(echo "${{ github.event.inputs.target }}" | sed 's/\//\\\//g')
+        # echo "CONFIG_TARGET_${TARGET%/*}=y" > .config
+        # echo "CONFIG_TARGET_${TARGET%/*}_${TARGET#*/}=y" >> .config
+        
+        echo "CONFIG_PACKAGE_plugin=m" >> .config
         make defconfig
-
     - name: 编译插件
+      working-directory: openwrt
       run: |
-        cd $SDK_PATH
-        make -j$(($(nproc) + 1)) V=s \
-          CONFIG_DEBUG_SECTION_MISMATCH=y \
-          CONFIG_PACKAGE_$PLUGIN_NAME=m
-
-    - name: 收集产物
+        make package/plugin/compile V=s
+    - name: 整理文件
       run: |
-        OUTPUT_DIR="$GITHUB_WORKSPACE/output"
-        mkdir -p $OUTPUT_DIR
-        
-        # 主程序包
-        find $SDK_PATH/bin -name "${PLUGIN_NAME}*.ipk" -exec cp {} $OUTPUT_DIR \;
-        
-        # 依赖包
-        find $SDK_PATH/bin -name "luci-*-openclash*.ipk" -exec cp {} $OUTPUT_DIR \;
-        
-        # 生成版本信息
-        echo "{
-          \"target\": \"${{ github.event.inputs.target }}\",
-          \"firmware_version\": \"${{ github.event.inputs.firmware_version }}\",
-          \"clash_core\": \"${{ github.event.inputs.clash_core_version }}\",
-          \"plugin_version\": \"${{ env.PLUGIN_VERSION }}\",
-          \"build_time\": \"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\"
-        }" > $OUTPUT_DIR/build-info.json
-
-    - name: 发布版本
-      uses: softprops/action-gh-release@v2
+        mkdir -p firmware
+        find openwrt/bin/packages/ -name "${{ env.PLUGIN_NAME }}*.ipk" | xargs -I {} mv {} firmware/
+        cd firmware
+        for file in *.ipk; do
+          mv "$file" "${{ steps.set_target.outputs.TARGET_DASH }}-${{ github.event.inputs.firmware_version }}-${{ env.PLUGIN_NAME }}-${{ env.PLUGIN_VERSION }}.ipk"
+        done
+        echo "生成的文件列表:"
+        ls -l
+    - name: 创建 Release
+      uses: softprops/action-gh-release@v1
       with:
-        files: |
-          output/*
-          !output/*.json
-        tag_name: openclash-${{ github.event.inputs.clash_core_version }}-${{ env.PLUGIN_VERSION }}
-        name: OpenClash ${{ github.event.inputs.clash_core_version }}
+        files: firmware/*
+        name: ${{ steps.set_target.outputs.TARGET_DASH }}-${{ github.event.inputs.firmware_version }}-${{ env.PLUGIN_NAME }}-${{ env.PLUGIN_VERSION }}
+        tag_name: v${{ github.event.inputs.firmware_version }}-${{ env.PLUGIN_NAME }}-${{ env.PLUGIN_VERSION }}
         body: |
-          ### 编译信息
-          🏗️ 目标架构: `${{ github.event.inputs.target }}`  
-          📦 OpenWrt版本: `${{ github.event.inputs.firmware_version }}`  
-          ⚡ Mihomo内核: `${{ github.event.inputs.clash_core_version }}`  
-          🧩 插件版本: `${{ env.PLUGIN_VERSION }}`  
-          🕒 编译时间: `$(date -u +'%Y-%m-%d %H:%M:%S UTC')`
-
-          ### 校验信息
-          ```json
-          $(cat output/build-info.json)
-          ```
+          目标平台/架构: ${{ github.event.inputs.target }}
+          固件版本: ${{ github.event.inputs.firmware_version }}
+          插件源码地址: ${{ github.event.inputs.plugin_source }}
+          插件版本: ${{ env.PLUGIN_VERSION }}
+          这个 Release 包含了编译好的 OpenWrt 插件。
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
