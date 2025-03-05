@@ -1,0 +1,152 @@
+name: 编译 OpenClash 插件
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '目标平台/架构 (例如 x86/64)'
+        required: true
+        default: 'x86/64'
+      firmware_version:
+        description: 'OpenWrt 版本'
+        required: true
+        default: '23.05.5'
+      clash_core_version:
+        description: 'Clash 内核版本'
+        required: true
+        default: '2024.05.01'
+
+env:
+  PLUGIN_NAME: luci-app-openclash
+  PLUGIN_VERSION: ${{ steps.get_version.outputs.VERSION }}
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    timeout-minutes: 45
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v3
+      
+    - name: 安装编译依赖
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
+        gettext git java-propose-classpath libelf-dev libncurses5-dev \
+        libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
+        unzip wget rsync subversion swig time xsltproc zlib1g-dev tree jq
+
+    - name: 设置 Python 环境
+      run: |
+        sudo ln -sf /usr/bin/python3 /usr/bin/python
+        python --version
+
+    - name: 解析目标参数
+      id: parse_target
+      run: |
+        TARGET_SLUG=$(echo "${{ inputs.target }}" | sed 's/\//-/g')
+        echo "TARGET_SLUG=$TARGET_SLUG" >> $GITHUB_OUTPUT
+        echo "ARCH=$(echo ${{ inputs.target }} | cut -d'/' -f2)" >> $GITHUB_OUTPUT
+
+    - name: 下载 OpenWrt SDK
+      run: |
+        SDK_BASE="https://downloads.openwrt.org/releases/${{ inputs.firmware_version }}/targets/${{ inputs.target }}/"
+        SDK_FILE=$(curl -s $SDK_BASE | grep -oP 'openwrt-sdk-.*?_${{ steps.parse_target.outputs.TARGET_SLUG }}_gcc-.*?_Linux-x86_64.tar.xz' | head -n1)
+        if [ -z "$SDK_FILE" ]; then
+          echo "::error::无法找到匹配的 SDK 文件"
+          exit 1
+        fi
+        echo "下载 SDK: $SDK_FILE"
+        wget "$SDK_BASE/$SDK_FILE" -O openwrt-sdk.tar.xz
+        mkdir openwrt
+        tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
+
+    - name: 克隆插件源码
+      working-directory: openwrt/package
+      run: |
+        git clone --depth 1 ${{ inputs.plugin_source }} ${{ env.PLUGIN_NAME }}
+        cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
+        
+        # 修复 Makefile 格式
+        sed -i 's/^    /\t/g' Makefile
+        sed -i 's/\r$//' Makefile
+
+        # 预置 Clash 内核
+        mkdir -p files/etc/openclash/core
+        case "${{ steps.parse_target.outputs.ARCH }}" in
+          "64")
+            CORE_URL="https://release.dreamacro.workers.dev/${{ inputs.clash_core_version }}/clash-linux-amd64-${{ inputs.clash_core_version }}.gz"
+            ;;
+          "armv8")
+            CORE_URL="https://release.dreamacro.workers.dev/${{ inputs.clash_core_version }}/clash-linux-arm64-${{ inputs.clash_core_version }}.gz"
+            ;;
+          *)
+            echo "::error::不支持的架构: ${{ steps.parse_target.outputs.ARCH }}"
+            exit 1
+            ;;
+        esac
+        
+        echo "下载内核: $CORE_URL"
+        wget -q "$CORE_URL" -O clash.gz
+        gunzip clash.gz
+        mv clash files/etc/openclash/core/
+        chmod +x files/etc/openclash/core/clash
+
+        # 禁用自动更新
+        sed -i '/option auto_update/{n;s/.*/        option auto_update \"0\"/}' root/etc/config/openclash
+        sed -i '/option release_branch/{n;s/.*/        option release_branch \"disabled\"/}' root/etc/config/openclash
+
+    - name: 配置编译环境
+      working-directory: openwrt
+      run: |
+        echo "CONFIG_TARGET_${{ inputs.target | replace('/','_') }}=y" > .config
+        echo "CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m" >> .config
+        echo "CONFIG_PACKAGE_dnsmasq-full=y" >> .config
+        echo "CONFIG_PACKAGE_iptables-mod-tproxy=y" >> .config
+        echo "CONFIG_PACKAGE_luci-compat=y" >> .config
+        make defconfig
+
+    - name: 编译插件
+      working-directory: openwrt
+      run: |
+        export PATH=$PATH:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin
+        make -j$(nproc) package/${{ env.PLUGIN_NAME }}/compile V=s
+
+    - name: 打包制品
+      run: |
+        mkdir -p artifacts
+        find openwrt/bin/packages -name "${{ env.PLUGIN_NAME }}*.ipk" -exec cp {} artifacts/ \;
+        cd artifacts
+        for f in *.ipk; do
+          mv "$f" "openclash_${{ inputs.target | replace('/','-') }}_${{ inputs.firmware_version }}_${{ inputs.clash_core_version }}.ipk"
+        done
+        echo "生成文件:"
+        ls -lh
+
+    - name: 上传制品
+      uses: actions/upload-artifact@v3
+      with:
+        name: openclash-packages
+        path: artifacts/*.ipk
+
+    - name: 创建 GitHub Release
+      if: success()
+      uses: softprops/action-gh-release@v1
+      with:
+        files: artifacts/*.ipk
+        tag_name: openclash-${{ inputs.target }}-${{ inputs.firmware_version }}-${{ inputs.clash_core_version }}
+        name: OpenClash ${{ inputs.clash_core_version }} (${{ inputs.target }})
+        body: |
+          ### 编译信息
+          - ​**目标架构**: ${{ inputs.target }}
+          - ​**OpenWrt 版本**: ${{ inputs.firmware_version }}
+          - ​**Clash 内核版本**: ${{ inputs.clash_core_version }}
+          - ​**编译时间**: ${{ steps.get_timestamp.outputs.DATE }}
+          
+          ### 预置功能
+          ✅ 内置最新 Clash 内核  
+          ✅ 禁用自动更新  
+          ✅ 多架构支持
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
