@@ -1,28 +1,37 @@
-name: OpenClash AutoBuild with Core
+name: OpenClash AutoBuild (Auto-Trigger)
 
 on:
+  # 自动触发条件
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - 'package/**'
+      - '!**.md'
+  
+  # 每周一中午12点自动构建 (UTC时间)
+  schedule:
+    - cron: '0 12 * * 1'
+
+  # 手动触发配置
   workflow_dispatch:
     inputs:
       target:
-        description: 'Target Architecture (e.g. x86/64)'
+        description: '目标架构 (示例: x86/64)'
         required: true
         default: 'x86/64'
       firmware_version:
-        description: 'OpenWrt Version'
+        description: 'OpenWrt版本'
         required: true
         default: '23.05.5'
       clash_core:
-        description: 'Mihomo Core Version (with v prefix)'
+        description: 'Mihomo核心版本 (带v前缀)'
         required: true
         default: 'v1.18.0'
-      plugin_branch:
-        description: 'Plugin Source Branch'
-        required: true
-        default: 'master'
 
 env:
   BUILD_DIR: ${{ github.workspace }}/openwrt-build
   PLUGIN_NAME: luci-app-openclash
+  AUTO_MODE: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   build:
@@ -30,191 +39,146 @@ jobs:
     timeout-minutes: 60
 
     steps:
-    - name: 🏗️ Initialize Workspace
+    - name: 🛠️ 初始化工作区
+      if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
       run: |
         mkdir -p $BUILD_DIR
-        echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
+        echo "BUILD_TIMESTAMP=$(date +%s)" >> $GITHUB_ENV
 
-    - name: 📦 Install Dependencies
+    # 参数自动检测逻辑
+    - name: 🔍 自动检测参数
+      if: ${{ env.AUTO_MODE == 'true' }}
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          build-essential ccache ecj fastjar file g++ gawk gettext git \
-          libelf-dev libncurses5-dev libncursesw5-dev libssl-dev python3 \
-          python3-distutils python3-setuptools unzip wget rsync subversion \
-          swig time xsltproc zlib1g-dev tree jq p7zip-full upx-ucl
-
-    - name: 🔍 Parse Target Architecture
-      id: target_parser
-      run: |
-        case "${{ github.event.inputs.target }}" in
-          "x86/64")       ARCH="amd64"; TARGET_NAME="x86_64" ;;
-          "armvirt/64")   ARCH="armv8"; TARGET_NAME="armvirt" ;;
-          "arm64")        ARCH="armv8"; TARGET_NAME="arm64" ;;
-          "arm/armv7")    ARCH="armv7"; TARGET_NAME="armv7" ;;
-          "mips/mips32")  ARCH="mips"; TARGET_NAME="mips32" ;;
-          "mips/mips64")  ARCH="mips64"; TARGET_NAME="mips64" ;;
-          "riscv/64")     ARCH="riscv64"; TARGET_NAME="riscv64" ;;
-          *)              ARCH="amd64"; TARGET_NAME="generic" ;;
-        esac
-
-        TARGET_DASH=$(echo "${{ github.event.inputs.target }}" | tr '/' '-')
-        echo "ARCH=$ARCH" >> $GITHUB_ENV
-        echo "TARGET_DASH=$TARGET_DASH" >> $GITHUB_ENV
-        echo "TARGET_NAME=$TARGET_NAME" >> $GITHUB_ENV
-
-    - name: 🔒 Core Version Validation
-      run: |
-        CORE_API="https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${{ github.event.inputs.clash_core }}"
-        if ! curl -sfL "$CORE_API" | jq -e .id >/dev/null; then
-          echo "::error::❌ Invalid core version: ${{ github.event.inputs.clash_core }}"
-          echo "Available versions: https://github.com/MetaCubeX/mihomo/releases"
-          exit 1
+        # 从commit message中提取参数
+        COMMIT_MSG="${{ github.event.head_commit.message }}"
+        
+        # 架构检测
+        if [[ "$COMMIT_MSG" =~ \[ARM ]]; then
+          echo "TARGET=arm/armv7" >> $GITHUB_ENV
+        elif [[ "$COMMIT_MSG" =~ \[RISCV ]]; then
+          echo "TARGET=riscv/64" >> $GITHUB_ENV
+        else
+          echo "TARGET=x86/64" >> $GITHUB_ENV
         fi
 
-    - name: 📥 Download OpenWrt SDK
-      timeout-minutes: 15
+        # 版本检测
+        if [[ "$COMMIT_MSG" =~ FW_VER=[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+          echo "FIRMWARE_VER=${BASH_REMATCH[0]#*=}" >> $GITHUB_ENV
+        else
+          echo "FIRMWARE_VER=23.05.5" >> $GITHUB_ENV
+        fi
+
+        if [[ "$COMMIT_MSG" =~ CORE_VER=v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+          echo "CORE_VER=${BASH_REMATCH[0]}" >> $GITHUB_ENV
+        else
+          echo "CORE_VER=v1.18.0" >> $GITHUB_ENV
+        fi
+
+    # 手动模式参数处理
+    - name: 📝 获取手动输入
+      if: ${{ env.AUTO_MODE == 'false' }}
       run: |
-        SDK_BASE="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}"
+        echo "TARGET=${{ github.event.inputs.target }}" >> $GITHUB_ENV
+        echo "FIRMWARE_VER=${{ github.event.inputs.firmware_version }}" >> $GITHUB_ENV
+        echo "CORE_VER=${{ github.event.inputs.clash_core }}" >> $GITHUB_ENV
+
+    # 公共构建流程
+    - name: 📦 下载SDK
+      run: |
+        SDK_BASE="https://downloads.openwrt.org/releases/${{ env.FIRMWARE_VER }}/targets/${{ env.TARGET }}"
         
-        # 分阶段下载尝试
+        # 智能SDK检测
         SDK_FILE=$(
-          curl -sfL "$SDK_BASE/" | \
-          grep -oE 'openwrt-sdk-[^"]+Linux-x86_64\.tar\.xz' | \
+          curl -sfL "$SDK_BASE/" | 
+          grep -oE 'openwrt-sdk-[^"]+Linux-x86_64\.tar\.xz' |
           sort -V | tail -1
-        ) || true
+        ) || echo "::warning::使用备用匹配方案"
 
-        # 备用匹配方案
-        [ -z "$SDK_FILE" ] && SDK_FILE="openwrt-sdk-${{ github.event.inputs.firmware_version }}-${{ env.TARGET_DASH }}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-
-        echo "🔍 Selected SDK: $SDK_FILE"
+        [ -z "$SDK_FILE" ] && SDK_FILE="openwrt-sdk-${{ env.FIRMWARE_VER }}-$(echo ${{ env.TARGET }} | tr '/' '-')_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+        
+        echo "🔗 SDK下载地址: $SDK_BASE/$SDK_FILE"
         curl --retry 3 --retry-all-errors -fL -o sdk.tar.xz "$SDK_BASE/$SDK_FILE"
-
-        # 增强文件验证
+        
+        # 文件验证
         {
-          echo "🔬 File Type Check..."
-          file -b sdk.tar.xz | grep -q "XZ compressed data" &&
-          echo "✅ File type verified" &&
-          echo "🧪 Integrity Check..." &&
-          xz -tvv sdk.tar.xz 2>&1 | grep 'No errors detected'
+          echo "🔬 文件类型检查..." &&
+          file -b sdk.tar.xz | grep "XZ compressed data" &&
+          echo "🧪 完整性验证..." &&
+          xz -tvv sdk.tar.xz
         } || {
-          echo "::error::❌ Invalid SDK file detected"
-          echo "Possible issues:"
-          echo "1. Network failure (Retry the job)"
-          echo "2. Incorrect firmware/target combination"
-          echo "3. Server-side file corruption"
+          echo "::error::文件验证失败"
           exit 1
         }
 
         tar -xJf sdk.tar.xz -C $BUILD_DIR --strip-components=1
         rm -f sdk.tar.xz
 
-    - name: 💾 Prepare Plugin Source
+    - name: 💾 准备插件源码
       run: |
         cd $BUILD_DIR
-        git clone --depth 1 --branch ${{ github.event.inputs.plugin_branch }} \
+        git clone --depth 1 --branch ${{ github.ref_name || 'master' }} \
           https://github.com/vernesong/OpenClash package/$PLUGIN_NAME
-
-        # 自动修复Makefile格式
+        
+        # 自动修复Makefile
         cd package/$PLUGIN_NAME/$PLUGIN_NAME
         sed -i 's/^    /\t/g' Makefile
-        [ -f "Makefile" ] || { echo "::error::Makefile missing"; exit 1; }
+        [ -f "Makefile" ] || { echo "::error::Makefile缺失"; exit 1; }
 
-        # 获取版本信息
-        PLUGIN_VERSION=$(make -s -f version.mk 2>/dev/null | grep PKG_VERSION | cut -d= -f2)
-        echo "PLUGIN_VERSION=${PLUGIN_VERSION:-snapshot}" >> $GITHUB_ENV
-
-    - name: ⚙️ Preload Mihomo Core
+    - name: ⚙️ 预置核心文件
       run: |
         CORE_DIR="$BUILD_DIR/package/$PLUGIN_NAME/$PLUGIN_NAME/files/etc/openclash/core"
         mkdir -p $CORE_DIR
-
+        
         # 多镜像源下载
         MIRRORS=(
-          "https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core }}/mihomo-linux-$ARCH.gz"
-          "https://mirror.ghproxy.com/https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core }}/mihomo-linux-$ARCH.gz"
+          "https://github.com/MetaCubeX/mihomo/releases/download/${{ env.CORE_VER }}/mihomo-linux-$(echo ${{ env.TARGET }} | sed 's/x86\/64/amd64/; s/arm\/armv7/armv7/; s/riscv\/64/riscv64/').gz"
+          "https://mirror.ghproxy.com/https://github.com/MetaCubeX/mihomo/releases/download/${{ env.CORE_VER }}/mihomo-linux-$(echo ${{ env.TARGET }} | sed 's/x86\/64/amd64/; s/arm\/armv7/armv7/; s/riscv\/64/riscv64/').gz"
         )
 
         for url in "${MIRRORS[@]}"; do
           if curl -sfL "$url" | gunzip > "$CORE_DIR/clash"; then
             chmod 755 "$CORE_DIR/clash"
-            echo "✅ Core downloaded from $url"
+            echo "✅ 核心文件下载成功: $url"
             break
           fi
         done
 
-        [ -x "$CORE_DIR/clash" ] || { echo "::error::❌ Core download failed"; exit 1; }
+        [ -x "$CORE_DIR/clash" ] || { echo "::error::核心文件获取失败"; exit 1; }
 
-    - name: 🔧 Configure Build
+    - name: 🏗️ 编译插件
       run: |
         cd $BUILD_DIR
         cat << EOF > .config
-        CONFIG_TARGET_${TARGET_NAME}=y
+        CONFIG_TARGET_$(echo ${{ env.TARGET }} | tr '/a-z-' 'A-Z_')=y
         CONFIG_PACKAGE_${PLUGIN_NAME}=m
         CONFIG_PACKAGE_luci-compat=y
-        CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=m
         EOF
         
         make defconfig
-        diff -u .config.default .config || true
+        make -j$(($(nproc) + 2)) V=s package/${PLUGIN_NAME}/compile
 
-    - name: 🏭 Compile Package
-      timeout-minutes: 30
-      run: |
-        cd $BUILD_DIR
-        make -j$(($(nproc) + 2)) \
-          V=sc \
-          CONFIG_DEBUG_SECTION_MISMATCH=y \
-          package/${PLUGIN_NAME}/compile
-
-        # 二次验证产物
-        find bin/ -name '*.ipk' | xargs -I {} sh -c 'echo "📦 Found: {} ($(du -h {} | cut -f1))"'
-
-    - name: 📤 Package Artifacts
-      run: |
-        OUTPUT_DIR="${{ github.workspace }}/artifacts"
-        mkdir -p $OUTPUT_DIR
-        
-        # 收集所有相关文件
-        find $BUILD_DIR/bin -name '*.ipk' -exec cp {} $OUTPUT_DIR \;
-        
-        # 生成校验文件
-        cd $OUTPUT_DIR
-        sha256sum *.ipk > checksums.txt
-        jq -n \
-          --arg target "${{ github.event.inputs.target }}" \
-          --arg fw_ver "${{ github.event.inputs.firmware_version }}" \
-          --arg core_ver "${{ github.event.inputs.clash_core }}" \
-          --arg plugin_ver "${{ env.PLUGIN_VERSION }}" \
-          '{target: $target, openwrt: $fw_ver, core: $core_ver, plugin: $plugin_ver}' \
-          > build-info.json
-
-        echo "🎉 Build artifacts ready:"
-        tree -h
-
-    - name: 🚀 Create Release
+    - name: 🚀 发布产物
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          artifacts/*.ipk
-          artifacts/checksums.txt
-          artifacts/build-info.json
-        tag_name: openclash-${{ github.event.inputs.clash_core }}-${{ env.PLUGIN_VERSION }}
-        name: OpenClash ${{ github.event.inputs.clash_core }} (${ env.PLUGIN_VERSION })
+          $BUILD_DIR/bin/packages/**/*.ipk
+        tag_name: openclash-${{ env.CORE_VER }}-$(date +%Y%m%d)
+        name: OpenClash ${{ env.CORE_VER }} Build
         body: |
-          ### Build Information
-          | Component        | Version               |
-          |-------------------|-----------------------|
-          | Target           | `${{ github.event.inputs.target }}` |
-          | OpenWrt          | `${{ github.event.inputs.firmware_version }}` |
-          | Mihomo Core      | `${{ github.event.inputs.clash_core }}` |
-          | Plugin Version   | `${{ env.PLUGIN_VERSION }}` |
+          ### 构建信息
+          | 参数          | 值                      |
+          |---------------|-------------------------|
+          | 触发方式      | ${{ github.event_name }} |
+          | 目标架构      | ${{ env.TARGET }}       |
+          | OpenWrt版本   | ${{ env.FIRMWARE_VER }} |
+          | 核心版本      | ${{ env.CORE_VER }}     |
+          | 构建时间      | $(date -u +"%Y-%m-%dT%H:%M:%SZ") |
 
-          ### Verification
-          ```bash
-          sha256sum -c checksums.txt
-          ```
-
-          Built at: `$(date -u +"%Y-%m-%dT%H:%M:%SZ")`
+          ### 使用指南
+          1. 通过SSH上传ipk文件到路由器
+          2. 运行安装命令： 
+             ```bash
+             opkg install ./luci-app-openclash_*.ipk
+             ```
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
