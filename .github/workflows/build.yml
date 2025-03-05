@@ -59,47 +59,14 @@ jobs:
     - name: 下载 OpenWrt SDK
       run: |
         SDK_BASE_URL="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
-        echo "🛠️ SDK 基地址: $SDK_BASE_URL"
-
-        # 改进的文件名匹配模式
         SDK_FILE=$(curl -s "$SDK_BASE_URL" | grep -oP "openwrt-sdk-.*?-${{ steps.parse_target.outputs.TARGET_DASH }}_gcc-.*?Linux-x86_64.tar.xz" | head -n1)
-        
+
         if [ -z "$SDK_FILE" ]; then
-          echo "::error::❌ 未找到 SDK 文件，请检查以下内容："
-          echo "1. 目标架构是否正确: ${{ github.event.inputs.target }}"
-          echo "2. 版本是否存在: ${{ github.event.inputs.firmware_version }}"
-          echo "3. 官方下载页面内容:"
-          curl -s "$SDK_BASE_URL" | head -n 20
+          echo "::error::❌ SDK 文件未找到，请检查版本和架构"
           exit 1
         fi
 
-        SDK_URL="${SDK_BASE_URL}${SDK_FILE}"
-        echo "🔗 下载地址: $SDK_URL"
-
-        # 带重试的下载逻辑
-        for i in {1..3}; do
-          if wget --progress=bar:force:noscroll "$SDK_URL" -O openwrt-sdk.tar.xz; then
-            echo "✅ 下载成功 (第 $i 次尝试)"
-            break
-          elif [ $i -eq 3 ]; then
-            echo "::error::❌ 下载失败，请手动验证链接有效性"
-            echo "测试命令: wget -q --spider '$SDK_URL'"
-            exit 1
-          else
-            echo "⚠️ 下载失败，10秒后重试..."
-            sleep 10
-          fi
-        done
-
-        # 文件完整性校验
-        if ! tar -tvJf openwrt-sdk.tar.xz >/dev/null 2>&1; then
-          echo "::error::❌ 文件校验失败，可能原因："
-          echo "1. 下载不完整"
-          echo "2. 服务器文件损坏"
-          exit 1
-        fi
-
-        mkdir -p openwrt
+        wget --tries=3 --progress=bar:force:noscroll "${SDK_BASE_URL}${SDK_FILE}" -O openwrt-sdk.tar.xz
         tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
         rm openwrt-sdk.tar.xz
 
@@ -109,15 +76,33 @@ jobs:
         git clone --depth 1 --branch master https://github.com/vernesong/OpenClash.git ${{ env.PLUGIN_NAME }}
         
         cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
-        sed -i -e 's/^    /\t/g' -e 's/\r$//' Makefile
 
-        # Makefile 格式验证
-        echo "::group::Makefile 缩进检查"
-        if grep -q '^    ' Makefile; then
-          echo "❌ 检测到空格缩进，正在修复..."
-          sed -i 's/^    /\t/g' Makefile
+        # ========== Makefile 修复步骤 ==========
+        echo "::group::修复 Makefile 格式"
+        echo "原始文件前五行："
+        cat -e -t -v Makefile | head -n5
+
+        # 修复所有缩进问题
+        sed -i '
+          s/^    /\t/g;
+          s/^  /\t/g;
+          s/^ \+/\t/g;
+          s/\r$//;
+        ' Makefile
+
+        echo "修复后文件前五行："
+        cat -e -t -v Makefile | head -n5
+        echo "::endgroup::"
+
+        # ========== 严格缩进验证 ==========
+        echo "::group::Tab缩进验证"
+        BAD_LINES=$(grep -n '^[[:space:]]*[^[:blank:]]' Makefile | grep -v '^\t')
+        if [ -n "$BAD_LINES" ]; then
+          echo "❌ 缩进验证失败，异常行："
+          echo "$BAD_LINES"
+          exit 1
         fi
-        grep -n -m 3 '^\t' Makefile || { echo "::error::Tab缩进验证失败"; exit 1; }
+        echo "✅ 所有缩进均为Tab"
         echo "::endgroup::"
 
         # 预置 mihomo 内核
@@ -134,24 +119,19 @@ jobs:
           echo "🔍 尝试下载: $url"
           if curl --output /dev/null --silent --head --fail "$url"; then
             echo "✅ 有效链接: $url"
-            if wget -q --show-progress "$url" -O clash.gz; then
-              if gunzip -t clash.gz; then
-                gunzip clash.gz
-                mv clash $CORE_DIR/
-                chmod 755 $CORE_DIR/clash
-                echo "🎉 内核预置成功"
-                break
-              else
-                echo "⚠️ 压缩包损坏，尝试下一个链接..."
-                rm -f clash.gz
-              fi
-            fi
+            wget -q --show-progress "$url" -O clash.gz
+            gunzip clash.gz
+            mv clash $CORE_DIR/
+            chmod 755 $CORE_DIR/clash
+            break
           fi
         done
 
         # 禁用自动更新
-        sed -i -e 's/option auto_update .*/option auto_update "0"/' \
-               -e 's/option release_branch .*/option release_branch "disabled"/' root/etc/config/openclash
+        sed -i '
+          s/option auto_update .*/option auto_update "0"/;
+          s/option release_branch .*/option release_branch "disabled"/;
+        ' root/etc/config/openclash
 
     - name: 配置编译环境
       working-directory: openwrt
@@ -165,9 +145,6 @@ jobs:
         EOF
         
         make defconfig
-        echo "::group::编译配置预览"
-        grep -rn "CONFIG_TARGET\|CONFIG_PACKAGE" .config
-        echo "::endgroup::"
 
     - name: 执行编译
       working-directory: openwrt
@@ -175,24 +152,17 @@ jobs:
         export PATH="$PATH:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin"
         make -j$(($(nproc) + 1)) package/${{ env.PLUGIN_NAME }}/compile V=s
 
-        echo "::group::编译产物验证"
-        find bin -name "*.ipk" -exec ls -lh {} \;
-        echo "::endgroup::"
-
     - name: 打包输出
       run: |
         ARTIFACT_DIR="openclash_${{ steps.parse_target.outputs.TARGET_DASH }}_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}"
         mkdir -p $ARTIFACT_DIR
         find openwrt/bin/packages -name "luci-app-openclash*.ipk" -exec cp -v {} $ARTIFACT_DIR/ \;
-        echo "📦 生成文件列表:"
-        ls -lh $ARTIFACT_DIR
 
     - name: 上传制品
       uses: actions/upload-artifact@v4
       with:
         name: openclash-packages
         path: openclash_*/*.ipk
-        retention-days: 7
 
     - name: 创建 Release
       uses: softprops/action-gh-release@v2
@@ -203,14 +173,8 @@ jobs:
         name: OpenClash ${{ github.event.inputs.clash_core_version }} (${{ github.event.inputs.target }})
         body: |
           ### 编译信息
-          - ​**目标架构**: `${{ github.event.inputs.target }}`
-          - ​**OpenWrt 版本**: ${{ github.event.inputs.firmware_version }}
-          - ​**mihomo 版本**: ${{ github.event.inputs.clash_core_version }}
-          - ​**编译时间**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          ### 安装说明
-          ```bash
-          opkg install luci-app-openclash_*.ipk
-          /etc/init.d/openclash start
-          ```
+          - 架构：`${{ github.event.inputs.target }}`
+          - OpenWrt：${{ github.event.inputs.firmware_version }}
+          - mihomo：${{ github.event.inputs.clash_core_version }}
+          - 编译时间：$(date -u +"%Y-%m-%dT%H:%M:%SZ")
         files: openclash_*/*.ipk
