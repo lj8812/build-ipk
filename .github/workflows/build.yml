@@ -1,173 +1,220 @@
-name: OpenClash 插件编译 (含 Mihomo 内核)
+name: OpenClash AutoBuild with Core
 
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: '目标架构 (如 x86/64)'
+        description: 'Target Architecture (e.g. x86/64)'
         required: true
         default: 'x86/64'
       firmware_version:
-        description: 'OpenWrt 版本'
+        description: 'OpenWrt Version'
         required: true
         default: '23.05.5'
-      clash_core_version:
-        description: 'Mihomo 内核版本 (带 v 前缀)'
+      clash_core:
+        description: 'Mihomo Core Version (with v prefix)'
         required: true
         default: 'v1.18.0'
       plugin_branch:
-        description: '插件源码分支'
+        description: 'Plugin Source Branch'
         required: true
         default: 'master'
 
 env:
-  PLUGIN_NAME: luci-app-openclash
   BUILD_DIR: ${{ github.workspace }}/openwrt-build
+  PLUGIN_NAME: luci-app-openclash
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
-    - name: 🛠️ 初始化环境
+    - name: 🏗️ Initialize Workspace
       run: |
         mkdir -p $BUILD_DIR
-        echo "🔧 工作目录: $BUILD_DIR"
+        echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
 
-    - name: 📥 安装编译依赖
+    - name: 📦 Install Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           build-essential ccache ecj fastjar file g++ gawk gettext git \
           libelf-dev libncurses5-dev libncursesw5-dev libssl-dev python3 \
           python3-distutils python3-setuptools unzip wget rsync subversion \
-          swig time xsltproc zlib1g-dev tree jq p7zip-full
+          swig time xsltproc zlib1g-dev tree jq p7zip-full upx-ucl
 
-    - name: 🐍 配置 Python 环境
-      run: |
-        sudo ln -sf /usr/bin/python3 /usr/bin/python
-        python -m pip install --upgrade pip
-        pip install requests
-
-    - name: 🌐 解析目标架构
-      id: parse_target
+    - name: 🔍 Parse Target Architecture
+      id: target_parser
       run: |
         case "${{ github.event.inputs.target }}" in
-          "x86/64")    ARCH="amd64"; TARGET_CFG="x86_64" ;;
-          "armvirt/64") ARCH="armv8"; TARGET_CFG="armvirt" ;;
-          "arm64")     ARCH="armv8"; TARGET_CFG="arm64" ;;
-          "arm/armv7") ARCH="armv7"; TARGET_CFG="armv7" ;;
-          *)           ARCH="amd64"; TARGET_CFG="generic" ;;
+          "x86/64")       ARCH="amd64"; TARGET_NAME="x86_64" ;;
+          "armvirt/64")   ARCH="armv8"; TARGET_NAME="armvirt" ;;
+          "arm64")        ARCH="armv8"; TARGET_NAME="arm64" ;;
+          "arm/armv7")    ARCH="armv7"; TARGET_NAME="armv7" ;;
+          "mips/mips32")  ARCH="mips"; TARGET_NAME="mips32" ;;
+          "mips/mips64")  ARCH="mips64"; TARGET_NAME="mips64" ;;
+          "riscv/64")     ARCH="riscv64"; TARGET_NAME="riscv64" ;;
+          *)              ARCH="amd64"; TARGET_NAME="generic" ;;
         esac
 
+        TARGET_DASH=$(echo "${{ github.event.inputs.target }}" | tr '/' '-')
         echo "ARCH=$ARCH" >> $GITHUB_ENV
-        echo "TARGET_CFG=$TARGET_CFG" >> $GITHUB_ENV
-        echo "TARGET_DASH=$(echo ${{ github.event.inputs.target }} | tr '/' '-')" >> $GITHUB_ENV
+        echo "TARGET_DASH=$TARGET_DASH" >> $GITHUB_ENV
+        echo "TARGET_NAME=$TARGET_NAME" >> $GITHUB_ENV
 
-    - name: 🔍 验证内核版本
+    - name: 🔒 Core Version Validation
       run: |
-        VERSION_URL="https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${{ github.event.inputs.clash_core_version }}"
-        if ! curl -sH "Accept: application/vnd.github.v3+json" "$VERSION_URL" | jq -e .id > /dev/null; then
-          echo "::error::❌ 无效的 Mihomo 版本: ${{ github.event.inputs.clash_core_version }}"
-          echo "可用版本列表: https://github.com/MetaCubeX/mihomo/releases"
+        CORE_API="https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${{ github.event.inputs.clash_core }}"
+        if ! curl -sfL "$CORE_API" | jq -e .id >/dev/null; then
+          echo "::error::❌ Invalid core version: ${{ github.event.inputs.clash_core }}"
+          echo "Available versions: https://github.com/MetaCubeX/mihomo/releases"
           exit 1
         fi
 
-    - name: 📦 下载 OpenWrt SDK
+    - name: 📥 Download OpenWrt SDK
+      timeout-minutes: 15
       run: |
         SDK_BASE="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}"
-        SDK_PATTERN="openwrt-sdk-.*-${{ env.TARGET_DASH }}.*Linux-x86_64.tar.xz"
         
-        echo "🔎 查找 SDK 文件..."
-        SDK_FILE=$(curl -sL "$SDK_BASE/" | grep -oP "$SDK_PATTERN" | head -1)
-        [ -z "$SDK_FILE" ] && { echo "::error::未找到 SDK 文件"; exit 1; }
+        # 分阶段下载尝试
+        SDK_FILE=$(
+          curl -sfL "$SDK_BASE/" | \
+          grep -oE 'openwrt-sdk-[^"]+Linux-x86_64\.tar\.xz' | \
+          sort -V | tail -1
+        ) || true
 
-        echo "⬇️ 下载: $SDK_BASE/$SDK_FILE"
-        curl --retry 3 -o sdk.tar.xz "$SDK_BASE/$SDK_FILE"
-        
-        echo "🔒 验证文件完整性..."
-        xz -t sdk.tar.xz || { echo "::error::文件损坏"; exit 1; }
-        
-        echo "📂 解压 SDK..."
+        # 备用匹配方案
+        [ -z "$SDK_FILE" ] && SDK_FILE="openwrt-sdk-${{ github.event.inputs.firmware_version }}-${{ env.TARGET_DASH }}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+
+        echo "🔍 Selected SDK: $SDK_FILE"
+        curl --retry 3 --retry-all-errors -fL -o sdk.tar.xz "$SDK_BASE/$SDK_FILE"
+
+        # 增强文件验证
+        {
+          echo "🔬 File Type Check..."
+          file -b sdk.tar.xz | grep -q "XZ compressed data" &&
+          echo "✅ File type verified" &&
+          echo "🧪 Integrity Check..." &&
+          xz -tvv sdk.tar.xz 2>&1 | grep 'No errors detected'
+        } || {
+          echo "::error::❌ Invalid SDK file detected"
+          echo "Possible issues:"
+          echo "1. Network failure (Retry the job)"
+          echo "2. Incorrect firmware/target combination"
+          echo "3. Server-side file corruption"
+          exit 1
+        }
+
         tar -xJf sdk.tar.xz -C $BUILD_DIR --strip-components=1
-        rm sdk.tar.xz
+        rm -f sdk.tar.xz
 
-    - name: 💾 准备插件源码
+    - name: 💾 Prepare Plugin Source
       run: |
         cd $BUILD_DIR
         git clone --depth 1 --branch ${{ github.event.inputs.plugin_branch }} \
           https://github.com/vernesong/OpenClash package/$PLUGIN_NAME
-        
+
+        # 自动修复Makefile格式
         cd package/$PLUGIN_NAME/$PLUGIN_NAME
         sed -i 's/^    /\t/g' Makefile
-        PLUGIN_VERSION=$(grep 'PKG_VERSION:' Makefile | cut -d= -f2 | tr -d ' ')
-        echo "PLUGIN_VERSION=$PLUGIN_VERSION" >> $GITHUB_ENV
+        [ -f "Makefile" ] || { echo "::error::Makefile missing"; exit 1; }
 
-    - name: ⚙️ 预置内核文件
+        # 获取版本信息
+        PLUGIN_VERSION=$(make -s -f version.mk 2>/dev/null | grep PKG_VERSION | cut -d= -f2)
+        echo "PLUGIN_VERSION=${PLUGIN_VERSION:-snapshot}" >> $GITHUB_ENV
+
+    - name: ⚙️ Preload Mihomo Core
       run: |
         CORE_DIR="$BUILD_DIR/package/$PLUGIN_NAME/$PLUGIN_NAME/files/etc/openclash/core"
         mkdir -p $CORE_DIR
-        
-        echo "⬇️ 下载 Mihomo ${{ github.event.inputs.clash_core_version }} 内核..."
-        CORE_URL="https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-linux-$ARCH.gz"
-        curl -L $CORE_URL | gunzip > $CORE_DIR/clash
-        chmod 755 $CORE_DIR/clash
 
-    - name: 🔧 配置编译环境
-      run: |
-        cd $BUILD_DIR
-        echo "CONFIG_TARGET_${TARGET_CFG}=y" > .config
-        echo "CONFIG_PACKAGE_$PLUGIN_NAME=m" >> .config
-        make defconfig
+        # 多镜像源下载
+        MIRRORS=(
+          "https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core }}/mihomo-linux-$ARCH.gz"
+          "https://mirror.ghproxy.com/https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core }}/mihomo-linux-$ARCH.gz"
+        )
 
-    - name: 🏗️ 编译插件
-      run: |
-        cd $BUILD_DIR
-        make -j$(($(nproc) + 1)) \
-          V=s \
-          CONFIG_DEBUG_SECTION_MISMATCH=y \
-          package/$PLUGIN_NAME/compile
-
-    - name: 📦 整理输出文件
-      run: |
-        OUTPUT_DIR="${{ github.workspace }}/output"
-        mkdir -p $OUTPUT_DIR
-        
-        find $BUILD_DIR/bin -name "*.ipk" -exec cp {} $OUTPUT_DIR \;
-        
-        for ipk in $OUTPUT_DIR/*.ipk; do
-          new_name="${{ env.TARGET_DASH }}_${{ github.event.inputs.firmware_version }}_${ipk##*/}"
-          mv "$ipk" "$OUTPUT_DIR/$new_name"
+        for url in "${MIRRORS[@]}"; do
+          if curl -sfL "$url" | gunzip > "$CORE_DIR/clash"; then
+            chmod 755 "$CORE_DIR/clash"
+            echo "✅ Core downloaded from $url"
+            break
+          fi
         done
 
-        echo "📄 生成版本信息..."
+        [ -x "$CORE_DIR/clash" ] || { echo "::error::❌ Core download failed"; exit 1; }
+
+    - name: 🔧 Configure Build
+      run: |
+        cd $BUILD_DIR
+        cat << EOF > .config
+        CONFIG_TARGET_${TARGET_NAME}=y
+        CONFIG_PACKAGE_${PLUGIN_NAME}=m
+        CONFIG_PACKAGE_luci-compat=y
+        CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=m
+        EOF
+        
+        make defconfig
+        diff -u .config.default .config || true
+
+    - name: 🏭 Compile Package
+      timeout-minutes: 30
+      run: |
+        cd $BUILD_DIR
+        make -j$(($(nproc) + 2)) \
+          V=sc \
+          CONFIG_DEBUG_SECTION_MISMATCH=y \
+          package/${PLUGIN_NAME}/compile
+
+        # 二次验证产物
+        find bin/ -name '*.ipk' | xargs -I {} sh -c 'echo "📦 Found: {} ($(du -h {} | cut -f1))"'
+
+    - name: 📤 Package Artifacts
+      run: |
+        OUTPUT_DIR="${{ github.workspace }}/artifacts"
+        mkdir -p $OUTPUT_DIR
+        
+        # 收集所有相关文件
+        find $BUILD_DIR/bin -name '*.ipk' -exec cp {} $OUTPUT_DIR \;
+        
+        # 生成校验文件
+        cd $OUTPUT_DIR
+        sha256sum *.ipk > checksums.txt
         jq -n \
           --arg target "${{ github.event.inputs.target }}" \
           --arg fw_ver "${{ github.event.inputs.firmware_version }}" \
-          --arg core_ver "${{ github.event.inputs.clash_core_version }}" \
+          --arg core_ver "${{ github.event.inputs.clash_core }}" \
           --arg plugin_ver "${{ env.PLUGIN_VERSION }}" \
-          '{target: $target, firmware: $fw_ver, core: $core_ver, plugin: $plugin_ver}' \
-          > $OUTPUT_DIR/build-info.json
+          '{target: $target, openwrt: $fw_ver, core: $core_ver, plugin: $plugin_ver}' \
+          > build-info.json
 
-    - name: 🚀 发布 Release
+        echo "🎉 Build artifacts ready:"
+        tree -h
+
+    - name: 🚀 Create Release
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          output/*
-        tag_name: openclash-${{ github.event.inputs.clash_core_version }}-${{ env.PLUGIN_VERSION }}
-        name: OpenClash ${{ github.event.inputs.clash_core_version }}
+          artifacts/*.ipk
+          artifacts/checksums.txt
+          artifacts/build-info.json
+        tag_name: openclash-${{ github.event.inputs.clash_core }}-${{ env.PLUGIN_VERSION }}
+        name: OpenClash ${{ github.event.inputs.clash_core }} (${ env.PLUGIN_VERSION })
         body: |
-          ### 编译信息
-          - ​**架构**: `${{ github.event.inputs.target }}`
-          - ​**OpenWrt**: `${{ github.event.inputs.firmware_version }}`
-          - ​**Mihomo**: `${{ github.event.inputs.clash_core_version }}`
-          - ​**插件版本**: `${{ env.PLUGIN_VERSION }}`
-          - ​**编译时间**: `$(date -u +"%Y-%m-%d %H:%M:%S UTC")`
+          ### Build Information
+          | Component        | Version               |
+          |-------------------|-----------------------|
+          | Target           | `${{ github.event.inputs.target }}` |
+          | OpenWrt          | `${{ github.event.inputs.firmware_version }}` |
+          | Mihomo Core      | `${{ github.event.inputs.clash_core }}` |
+          | Plugin Version   | `${{ env.PLUGIN_VERSION }}` |
 
-          ### 文件清单
-          ```json
-          $(cat output/build-info.json)
+          ### Verification
+          ```bash
+          sha256sum -c checksums.txt
           ```
+
+          Built at: `$(date -u +"%Y-%m-%dT%H:%M:%SZ")`
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
