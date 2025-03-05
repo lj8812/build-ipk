@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: '目标平台/架构 (例如 x86/64)'
+        description: '目标架构 (例如 x86/64)'
         required: true
         default: 'x86/64'
       firmware_version:
@@ -22,19 +22,20 @@ env:
 jobs:
   build:
     runs-on: ubuntu-20.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
     - name: 检出仓库
       uses: actions/checkout@v4
 
-    - name: 安装编译依赖
+    - name: 安装依赖工具链
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
-        gettext git libelf-dev libncurses5-dev libncursesw5-dev libssl-dev \
-        python3 python3-distutils python3-setuptools unzip wget rsync subversion \
-        swig time xsltproc zlib1g-dev tree jq
+        sudo apt-get install -y \
+          build-essential ccache ecj fastjar file g++ gawk gettext git \
+          libelf-dev libncurses5-dev libncursesw5-dev libssl-dev python3 \
+          python3-distutils python3-setuptools unzip wget rsync subversion \
+          swig time xsltproc zlib1g-dev tree jq
 
     - name: 设置 Python 环境
       run: |
@@ -44,53 +45,72 @@ jobs:
     - name: 解析目标参数
       id: parse_target
       run: |
+        # 转换架构格式 x86/64 → x86-64
         TARGET_SLUG=$(echo "${{ github.event.inputs.target }}" | sed 's/\//-/g')
         echo "TARGET_SLUG=$TARGET_SLUG" >> $GITHUB_OUTPUT
-        ARCH=$(echo "${{ github.event.inputs.target }}" | cut -d'/' -f2)
-        echo "ARCH=$ARCH" >> $GITHUB_OUTPUT
+        
+        # 提取架构后缀 (64/armv8)
+        ARCH_TYPE=$(echo "${{ github.event.inputs.target }}" | cut -d'/' -f2)
+        echo "ARCH_TYPE=$ARCH_TYPE" >> $GITHUB_OUTPUT
 
     - name: 下载 OpenWrt SDK
       run: |
         SDK_BASE="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
-        echo "SDK 下载地址: $SDK_BASE"
-        
-        # 动态生成精确匹配模式
-        if [[ "${{ github.event.inputs.target }}" == "x86/64" ]]; then
-          PATTERN='openwrt-sdk-.*-x86-64_gcc-.*_musl\.Linux-x86_64\.tar\.xz'
-        elif [[ "${{ github.event.inputs.target }}" == "armvirt/64" ]]; then
-          PATTERN='openwrt-sdk-.*-armvirt-64-gcc-.*_musl\.Linux-x86_64\.tar\.xz'
-        else
-          echo "::error::不支持的架构类型"
+        echo "🛠️ SDK 下载目录: $SDK_BASE"
+
+        # 动态生成匹配模式
+        case "${{ github.event.inputs.target }}" in
+          "x86/64")
+            PATTERN='openwrt-sdk-\d+\.\d+\.\d+-x86-64_gcc-\d+\.\d+\.\d+_musl\.Linux-x86_64\.tar\.xz'
+            ;;
+          "armvirt/64")
+            PATTERN='openwrt-sdk-\d+\.\d+\.\d+-armvirt-64-gcc-\d+\.\d+\.\d+_musl\.Linux-x86_64\.tar\.xz'
+            ;;
+          *)
+            echo "::error::不支持的架构类型"
+            exit 1
+            ;;
+        esac
+
+        # 提取 SDK 文件名
+        SDK_FILE=$(curl -s "$SDK_BASE" | grep -oP "$PATTERN" | head -n1)
+        echo "🔍 匹配到的 SDK 文件: $SDK_FILE"
+
+        if [ -z "$SDK_FILE" ]; then
+          echo "::error::❌ 未找到符合的 SDK 文件"
           exit 1
         fi
 
-        SDK_FILE=$(curl -s "$SDK_BASE" | grep -oP "$PATTERN" | head -n1)
-        echo "匹配到的 SDK 文件: $SDK_FILE"
-        
-        if [ -z "$SDK_FILE" ]; then
-          echo "::error::无法找到匹配的 SDK 文件"
+        # 验证下载链接有效性
+        FULL_URL="${SDK_BASE}${SDK_FILE}"
+        echo "🔗 完整下载地址: $FULL_URL"
+        if ! curl --output /dev/null --silent --head --fail "$FULL_URL"; then
+          echo "::error::❌ 下载链接无效"
           exit 1
         fi
-        
-        wget "${SDK_BASE}${SDK_FILE}" -O openwrt-sdk.tar.xz
+
+        # 下载并解压 SDK
+        echo "⬇️ 开始下载 SDK..."
+        wget --progress=dot:giga "$FULL_URL" -O openwrt-sdk.tar.xz
         mkdir -p openwrt
         tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
-        echo "SDK 解压完成，目录结构:"
-        ls -lh openwrt
+        echo "✅ SDK 解压完成"
 
     - name: 准备插件源码
       working-directory: openwrt/package
       run: |
+        echo "📦 克隆 OpenClash 仓库..."
         git clone --depth 1 https://github.com/lj8812/OpenClash ${{ env.PLUGIN_NAME }}
-        cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
         
-        # 修复 Makefile 格式
-        sed -i 's/^    /\t/g' Makefile
-        sed -i 's/\r$//' Makefile
+        cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
+        echo "🔧 修复 Makefile 格式..."
+        sed -i 's/^    /\t/g' Makefile    # 替换空格为 Tab
+        sed -i 's/\r$//' Makefile         # 移除 Windows 换行符
 
         # 预置 Clash 内核
+        echo "⬇️ 下载 Clash 内核..."
         mkdir -p files/etc/openclash/core
-        case "${{ steps.parse_target.outputs.ARCH }}" in
+        case "${{ steps.parse_target.outputs.ARCH_TYPE }}" in
           "64")
             CORE_URL="https://github.com/Dreamacro/clash/releases/download/${{ github.event.inputs.clash_core_version }}/clash-linux-amd64-${{ github.event.inputs.clash_core_version }}.gz"
             ;;
@@ -98,27 +118,31 @@ jobs:
             CORE_URL="https://github.com/Dreamacro/clash/releases/download/${{ github.event.inputs.clash_core_version }}/clash-linux-arm64-${{ github.event.inputs.clash_core_version }}.gz"
             ;;
           *)
-            echo "::error::不支持的架构: ${{ steps.parse_target.outputs.ARCH }}"
+            echo "::error::❌ 不支持的架构类型: ${{ steps.parse_target.outputs.ARCH_TYPE }}"
             exit 1
             ;;
         esac
 
-        echo "下载内核: $CORE_URL"
+        echo "🔗 内核下载地址: $CORE_URL"
         if ! wget -q --show-progress "$CORE_URL" -O clash.gz; then
-          echo "::error::内核下载失败"
+          echo "::error::❌ 内核下载失败"
           exit 1
         fi
+        
         gunzip clash.gz
         mv clash files/etc/openclash/core/
         chmod +x files/etc/openclash/core/clash
+        echo "✅ 内核预置完成"
 
         # 禁用自动更新
+        echo "⚙️ 禁用自动更新..."
         sed -i 's/option auto_update .*/option auto_update "0"/' root/etc/config/openclash
         sed -i 's/option release_branch .*/option release_branch "disabled"/' root/etc/config/openclash
 
     - name: 配置编译环境
       working-directory: openwrt
       run: |
+        echo "⚙️ 生成编译配置..."
         TARGET_CONFIG="CONFIG_TARGET_$(echo '${{ github.event.inputs.target }}' | tr / _)"
         echo "$TARGET_CONFIG=y" > .config
         echo "CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m" >> .config
@@ -130,6 +154,7 @@ jobs:
     - name: 执行编译
       working-directory: openwrt
       run: |
+        echo "🔨 开始编译..."
         export PATH=$PATH:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin
         make -j$(nproc) package/${{ env.PLUGIN_NAME }}/compile V=s
 
@@ -139,14 +164,17 @@ jobs:
 
     - name: 打包输出文件
       run: |
+        echo "📦 打包制品..."
         mkdir -p artifacts
         find openwrt/bin/packages -name "${{ env.PLUGIN_NAME }}*.ipk" -exec cp -v {} artifacts/ \;
+        
         cd artifacts
         for f in *.ipk; do
-          new_name="openclash_$(echo '${{ github.event.inputs.target }}' | tr / -)_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}.ipk"
-          mv "$f" "$new_name"
+          NEW_NAME="openclash_$(echo '${{ github.event.inputs.target }}' | tr / -)_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}.ipk"
+          echo "🔄 重命名: $f → $NEW_NAME"
+          mv "$f" "$NEW_NAME"
         done
-        echo "最终生成文件:"
+        echo "✅ 最终生成文件:"
         ls -lh
 
     - name: 上传制品
@@ -156,7 +184,7 @@ jobs:
         path: artifacts/*.ipk
         retention-days: 7
 
-    - name: 创建版本发布
+    - name: 创建 GitHub Release
       if: success()
       uses: softprops/action-gh-release@v2
       with:
