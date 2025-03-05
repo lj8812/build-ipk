@@ -12,7 +12,7 @@ on:
         required: true
         default: '23.05.5'
       clash_core_version:
-        description: 'Clash.Meta 内核版本 (带 v 前缀)'
+        description: 'mihomo 内核版本 (带 v 前缀)'
         required: true
         default: 'v1.18.0'
 
@@ -59,53 +59,16 @@ jobs:
     - name: 下载 OpenWrt SDK
       run: |
         SDK_BASE="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
-        echo "🛠️ SDK 基地址: $SDK_BASE"
-
-        # 获取页面内容并解析
         SDK_PAGE=$(curl -sL "$SDK_BASE")
         SDK_FILE=$(echo "$SDK_PAGE" | grep -oE 'href="openwrt-sdk-[^"]+\.tar\.xz"' | sed 's/href="//;s/"//' | sort -Vr | head -n1)
 
         if [[ -z "$SDK_FILE" ]]; then
-          echo "::error::❌ SDK 文件未找到，请检查以下可能原因："
-          echo "1. 版本号是否正确？当前：${{ github.event.inputs.firmware_version }}"
-          echo "2. 目标架构是否存在？当前：${{ github.event.inputs.target }}"
-          echo "3. 页面内容验证："
-          echo "$SDK_PAGE" | head -n 20
-          exit 1
-        fi
-        echo "✅ 确认 SDK 文件: $SDK_FILE"
-
-        # URL 编码处理
-        ENCODED_FILE=$(echo "$SDK_FILE" | sed 's/ /%20/g')
-        FULL_URL="${SDK_BASE}${ENCODED_FILE}"
-        echo "🔗 最终下载地址: $FULL_URL"
-
-        # 增强下载重试逻辑
-        MAX_RETRY=5
-        for ((i=1; i<=MAX_RETRY; i++)); do
-          if wget --tries=3 --progress=bar:force:noscroll "$FULL_URL" -O sdk.tar.xz; then
-            echo "✅ 下载成功 (尝试次数: $i)"
-            break
-          elif [ $i -eq $MAX_RETRY ]; then
-            echo "::error::❌ 最终下载失败！请手动验证："
-            echo "wget -q --spider '$FULL_URL'"
-            exit 1
-          else
-            echo "⚠️ 下载失败，等待重试 (${i}/${MAX_RETRY})..."
-            sleep $((i * 10))
-          fi
-        done
-
-        # 压缩包完整性验证
-        if ! tar -tvJf sdk.tar.xz > /dev/null 2>&1; then
-          echo "::error::❌ 压缩包校验失败！可能原因："
-          echo "1. 文件下载不完整"
-          echo "2. 服务器文件损坏"
-          echo "3. 网络传输错误"
+          echo "::error::❌ SDK 文件未找到，请检查版本和架构"
           exit 1
         fi
 
-        mkdir -p openwrt
+        FULL_URL="${SDK_BASE}${SDK_FILE}"
+        wget --tries=3 --progress=bar:force:noscroll "$FULL_URL" -O sdk.tar.xz
         tar -xJf sdk.tar.xz -C openwrt --strip-components 1
         rm sdk.tar.xz
 
@@ -117,15 +80,16 @@ jobs:
         cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
         sed -i -e 's/^    /\t/g' -e 's/\r$//' Makefile
 
-        # 内核下载优化
+        # mihomo 内核下载
         CORE_DIR="files/etc/openclash/core"
         mkdir -p $CORE_DIR
         ARCH=${{ steps.parse_target.outputs.ARCH }}
 
         CORE_URLS=(
-          "https://github.com/MetaCubeX/Clash.Meta/releases/download/${{ github.event.inputs.clash_core_version }}/clash.meta-linux-${ARCH}.gz"
-          "https://github.com/MetaCubeX/Clash.Meta/releases/download/${{ github.event.inputs.clash_core_version }}/clash.meta-${ARCH}.gz"
-          "https://github.com/MetaCubeX/Clash.Meta/releases/download/${{ github.event.inputs.clash_core_version }}/clash.meta-${ARCH}-${{ github.event.inputs.clash_core_version }}.gz"
+          "https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-linux-$ARCH-${{ github.event.inputs.clash_core_version }}.gz"
+          "https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-linux-$ARCH.gz"
+          "https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-$ARCH-${{ github.event.inputs.clash_core_version }}.gz"
+          "https://github.com/MetaCubeX/mihomo/releases/download/${{ github.event.inputs.clash_core_version }}/mihomo-$ARCH.gz"
         )
 
         for url in "${CORE_URLS[@]}"; do
@@ -137,7 +101,7 @@ jobs:
               gunzip clash.gz
               mv clash $CORE_DIR/
               chmod 755 $CORE_DIR/clash
-              echo "🎉 内核下载成功"
+              echo "🎉 内核部署成功"
               break
             else
               echo "⚠️ 压缩包损坏，尝试下一个链接..."
@@ -157,44 +121,29 @@ jobs:
         CONFIG_TARGET_$(echo ${{ github.event.inputs.target }} | tr '/a-z' '_A-Z')=y
         CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}=m
         CONFIG_PACKAGE_dnsmasq-full=y
-        CONFIG_PACKAGE_coreutils-nohup=y
         CONFIG_PACKAGE_iptables-mod-tproxy=y
         CONFIG_PACKAGE_luci-compat=y
         EOF
         
         make defconfig
-        echo "ℹ️ 编译配置预览："
-        grep -rn "CONFIG_PACKAGE_${{ env.PLUGIN_NAME }}" .config
 
     - name: 执行编译
       working-directory: openwrt
       run: |
         export PATH="$PATH:$GITHUB_WORKSPACE/openwrt/staging_dir/host/bin"
-        make -j$(($(nproc) + 1)) package/${{ env.PLUGIN_NAME }}/compile V=sc 2>&1 | tee build.log
-        
-        if ! grep -q "package/${{ env.PLUGIN_NAME }}/compile: Finished" build.log; then
-          echo "::error::❌ 编译失败！错误摘要："
-          grep -iE 'error:|warning:|失败' build.log | head -n 50
-          exit 1
-        fi
+        make -j$(($(nproc) + 1)) package/${{ env.PLUGIN_NAME }}/compile V=sc
 
     - name: 打包输出
       run: |
         ARTIFACT_NAME="openclash_${{ steps.parse_target.outputs.TARGET_SLUG }}_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}"
         mkdir -p $ARTIFACT_NAME
-        
         find openwrt/bin/packages -name "luci-app-openclash*.ipk" -exec cp -v {} $ARTIFACT_NAME/ \;
-        echo "📦 生成文件列表："
-        ls -lh $ARTIFACT_NAME
 
     - name: 上传制品
       uses: actions/upload-artifact@v4
       with:
         name: openclash-packages
-        path: |
-          openclash_*
-          !*.tmp
-        retention-days: 7
+        path: openclash_*/*.ipk
 
     - name: 创建 Release
       uses: softprops/action-gh-release@v2
@@ -202,22 +151,9 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: openclash-${{ steps.parse_target.outputs.TARGET_SLUG }}-${{ github.event.inputs.firmware_version }}
-        name: OpenClash ${{ github.event.inputs.clash_core_version }} (${{ github.event.inputs.target }})
         body: |
-          ### 🚀 编译信息
-          - ​**架构**: `${{ github.event.inputs.target }}`
-          - ​**OpenWrt 版本**: ${{ github.event.inputs.firmware_version }}
-          - ​**Clash.Meta 版本**: ${{ github.event.inputs.clash_core_version }}
-          - ​**编译时间**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          ### 📥 安装说明
-          ```bash
-          opkg install luci-app-openclash_*.ipk
-          /etc/init.d/openclash start
-          ```
-
-          ### ⚠️ 注意事项
-          1. 已预置最新 Clash.Meta 内核
-          2. 默认禁用自动更新
-          3. 需要 200MB 以上存储空间
+          ### 编译信息
+          - 架构: ${{ github.event.inputs.target }}
+          - OpenWrt: ${{ github.event.inputs.firmware_version }}
+          - mihomo: ${{ github.event.inputs.clash_core_version }}
         files: openclash_*/*.ipk
