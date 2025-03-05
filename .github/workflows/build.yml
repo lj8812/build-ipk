@@ -26,7 +26,7 @@ jobs:
 
     steps:
     - name: 检出代码
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4 # 更新到最新稳定版
       
     - name: 安装编译依赖
       run: |
@@ -56,7 +56,6 @@ jobs:
           echo "::error::无法找到匹配的 SDK 文件"
           exit 1
         fi
-        echo "下载 SDK: $SDK_FILE"
         wget "$SDK_BASE/$SDK_FILE" -O openwrt-sdk.tar.xz
         mkdir openwrt
         tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
@@ -64,7 +63,7 @@ jobs:
     - name: 克隆插件源码
       working-directory: openwrt/package
       run: |
-        git clone --depth 1 ${{ github.event.inputs.plugin_source }} ${{ env.PLUGIN_NAME }}
+        git clone --depth 1 https://github.com/vernesong/OpenClash ${{ env.PLUGIN_NAME }}
         cd ${{ env.PLUGIN_NAME }}/luci-app-openclash
         
         # 修复 Makefile 格式
@@ -125,18 +124,16 @@ jobs:
           new_name="openclash_$(echo '${{ github.event.inputs.target }}' | tr / -)_${{ github.event.inputs.firmware_version }}_${{ github.event.inputs.clash_core_version }}.ipk"
           mv "$f" "$new_name"
         done
-        echo "生成文件:"
-        ls -lh
 
     - name: 上传制品
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4 # 使用最新稳定版本
       with:
         name: openclash-packages
         path: artifacts/*.ipk
 
     - name: 创建 GitHub Release
       if: success()
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2 # 更新到最新版本
       with:
         files: artifacts/*.ipk
         tag_name: openclash-${{ github.event.inputs.target }}-${{ github.event.inputs.firmware_version }}-${{ github.event.inputs.clash_core_version }}
@@ -147,10 +144,5 @@ jobs:
           - ​**OpenWrt 版本**: ${{ github.event.inputs.firmware_version }}
           - ​**Clash 内核版本**: ${{ github.event.inputs.clash_core_version }}
           - ​**编译时间**: ${{ steps.get_timestamp.outputs.DATE }}
-          
-          ### 预置功能
-          ✅ 内置最新 Clash 内核  
-          ✅ 禁用自动更新  
-          ✅ 多架构支持
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
