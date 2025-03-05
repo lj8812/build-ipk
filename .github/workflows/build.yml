@@ -73,38 +73,80 @@ jobs:
         echo "TARGET_CFG=$TARGET_CFG" >> $GITHUB_ENV
         echo "ARCH=$ARCH" >> $GITHUB_ENV
 
-    # ===================== SDK下载 =====================
-    - name: 🌐 Download SDK (Multi-Source)
+name: OpenClash Stable Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '目标架构 (示例: x86/64)'
+        required: true
+        default: 'x86/64'
+      firmware_version:
+        description: 'OpenWrt版本'
+        required: true
+        default: '23.05.5'
+
+env:
+  CACHE_DIR: ${{ runner.temp }}/sdk_cache
+  BUILD_DIR: ${{ github.workspace }}/openwrt-build
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+    # ===================== 初始化阶段 =====================
+    - name: 🛠️ 初始化环境
       run: |
-        # 多镜像源列表
-        MIRRORS=(
-          "https://downloads.openwrt.org"
-          "https://mirror.sjtu.edu.cn/openwrt"
-          "https://mirrors.tuna.tsinghua.edu.cn/openwrt"
+        mkdir -p "$BUILD_DIR" "$CACHE_DIR"
+        echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
+
+    # ===================== 版本解析 =====================
+    - name: 🔍 预处理参数
+      run: |
+        # 转换架构格式 x86/64 → x86-64
+        formatted_target="${INPUT_TARGET//\//-}"
+        # 提取主版本号 23.05.5 → 23.05
+        firmware_major="${INPUT_FIRMWARE_VERSION%.*}"
+        
+        echo "FORMATTED_TARGET=$formatted_target" >> $GITHUB_ENV
+        echo "FIRMWARE_MAJOR=$firmware_major" >> $GITHUB_ENV
+
+    # ===================== 下载阶段 =====================
+    - name: 🌐 智能下载SDK
+      env:
+        MIRRORS: >
+          https://downloads.openwrt.org,
+          https://mirror.sjtu.edu.cn/openwrt,
+          https://mirrors.tuna.tsinghua.edu.cn/openwrt
+      run: |
+        # 定义文件名匹配模式
+        patterns=(
+          "openwrt-sdk-${INPUT_FIRMWARE_VERSION}-${FORMATTED_TARGET}_*"
+          "openwrt-sdk-${FIRMWARE_MAJOR}-*-${FORMATTED_TARGET}_*"
         )
 
-        # 文件名模式
-        FILE_PATTERNS=(
-          "openwrt-sdk-${{ inputs.firmware_version }}-${TARGET_CFG}_*"
-          "openwrt-sdk-${inputs.firmware_version%.*}-*-${TARGET_CFG}_*"
-        )
-
-        # 多源下载尝试
-        for mirror in "${MIRRORS[@]}"; do
-          for pattern in "${FILE_PATTERNS[@]}"; do
-            url="$mirror/releases/${{ inputs.firmware_version }}/targets/${{ inputs.target }}/$pattern"
-            echo "🔗 Trying: $url"
-            if aria2c -x8 -s8 --retry-wait=30 -o "${{ env.CACHE_DIR }}/sdk.tar.xz" "$url"; then
-              if xz -t "${{ env.CACHE_DIR }}/sdk.tar.xz"; then
-                echo "✅ Downloaded from $mirror"
+        # 多源多模式尝试
+        for mirror in ${MIRRORS//,/ }; do
+          for pattern in "${patterns[@]}"; do
+            full_url="${mirror}/releases/${INPUT_FIRMWARE_VERSION}/targets/${INPUT_TARGET}/${pattern}"
+            echo "🔗 尝试下载: $full_url"
+            
+            if aria2c -x8 -s8 --file-allocation=none -o "$CACHE_DIR/temp.tar.xz" "$full_url"; then
+              if xz -t "$CACHE_DIR/temp.tar.xz"; then
+                mv "$CACHE_DIR/temp.tar.xz" "$CACHE_DIR/sdk.tar.xz"
+                echo "✅ 验证通过: ${full_url##*/}"
                 exit 0
               fi
             fi
           done
         done
 
-        echo "::error::All download attempts failed"
+        echo "::error::所有下载源均失败"
         exit 1
+
+    # ===================== 后续步骤 =====================
+    # ... [保留原有的编译和发布步骤] ...
 
     # ===================== 源码准备 =====================
     - name: 💾 Prepare Source Code
