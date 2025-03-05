@@ -43,19 +43,22 @@ jobs:
           gcc make
 
     # ===================== 构建po2lmo工具 =====================
-    - name: 🔧 编译po2lmo转换器
+    - name: 🔧 修复 po2lmo 编译
       run: |
-        # 克隆LuCI源码
+        sudo apt-get install -y gcc make
         git clone --depth 1 https://github.com/openwrt/luci
         cd luci
         
-        # 直接编译po2lmo
-        mkdir -p build
-        gcc -o build/po2lmo modules/luci-base/src/po2lmo.c
+        # 修正后的编译命令
+        gcc -I modules/luci-base/src \
+          -o po2lmo \
+          modules/luci-base/src/po2lmo.c \
+          modules/luci-base/src/sfh.c
         
-        # 安装到系统路径
-        sudo install -m 0755 build/po2lmo /usr/local/bin/
-        echo "✅ po2lmo版本: $(po2lmo --version || echo '未获取版本')"
+        # 安装验证
+        sudo install -m 0755 po2lmo /usr/local/bin/
+        echo "po2lmo 校验: $(file /usr/local/bin/po2lmo)"
+        po2lmo --version || echo "版本检测跳过"
 
     # ===================== 下载SDK核心 =====================
     - name: 🌐 多源下载SDK
