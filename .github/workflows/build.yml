@@ -75,13 +75,23 @@ jobs:
           -C $BUILD_DIR --strip-components=1
 
     # ===================== 构建核心工具 =====================
-    - name: 🔧 编译po2lmo
+    - name: 🔧 构建核心工具链
       run: |
-        git clone --depth 1 https://github.com/openwrt/luci $BUILD_DIR/luci
-        gcc -o $BUILD_DIR/staging_dir/host/bin/po2lmo \
-          $BUILD_DIR/luci/modules/luci-base/src/po2lmo.c \
-          $BUILD_DIR/luci/modules/luci-base/src/sfh.c
-        echo "✅ po2lmo 路径: $(which po2lmo)"
+        # 创建工具目录
+        mkdir -p $BUILD_DIR/staging_dir/host/bin
+
+        # 克隆LuCI源码
+        LUCI_DIR="${{ github.workspace }}/luci-source"
+        git clone --depth 1 --branch master \
+          https://github.com/openwrt/luci $LUCI_DIR
+
+        # 编译安装 po2lmo
+        gcc -Wall -O2 -o $BUILD_DIR/staging_dir/host/bin/po2lmo \
+          $LUCI_DIR/modules/luci-base/src/po2lmo.c \
+          $LUCI_DIR/modules/luci-base/src/sfh.c
+        
+        # 添加工具到PATH
+        echo "$BUILD_DIR/staging_dir/host/bin" >> $GITHUB_PATH
 
     # ===================== 编译插件 =====================
     - name: 🏭 编译OpenClash
