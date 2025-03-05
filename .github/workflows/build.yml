@@ -75,16 +75,15 @@ jobs:
           exit 1
         fi
 
-    - name: 下载并解压 OpenWrt SDK
+    - name: 下载 OpenWrt SDK
       run: |
-        SDK_BASE="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}"
-        SDK_FILE=$(curl -s $SDK_BASE/ | grep -oP "openwrt-sdk-.*-$TARGET_DASH.*Linux-x86_64.tar.xz" | head -1)
-        
-        echo "下载SDK: $SDK_BASE/$SDK_FILE"
-        wget --progress=dot:giga "$SDK_BASE/$SDK_FILE" -O openwrt-sdk.tar.xz
-        mkdir -p openwrt-sdk
-        tar -xJf openwrt-sdk.tar.xz -C openwrt-sdk --strip-components 1
-        echo "SDK_PATH=$GITHUB_WORKSPACE/openwrt-sdk" >> $GITHUB_ENV
+        SDK_BASE_URL="https://downloads.openwrt.org/releases/${{ github.event.inputs.firmware_version }}/targets/${{ github.event.inputs.target }}/"
+        SDK_FILE=$(curl -s "$SDK_BASE_URL" | grep -oP "openwrt-sdk-.*?-${{ steps.parse_target.outputs.TARGET_DASH }}_gcc-.*?Linux-x86_64.tar.xz" | head -n1)
+
+        mkdir -p openwrt
+        wget --tries=3 "${SDK_BASE_URL}${SDK_FILE}" -O openwrt-sdk.tar.xz
+        tar -xJf openwrt-sdk.tar.xz -C openwrt --strip-components 1
+        rm openwrt-sdk.tar.xz
 
     - name: 准备插件源码
       env:
